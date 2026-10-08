@@ -1,0 +1,13 @@
+node_modules
+apps/*/node_modules
+.git
+.vectoree
+.env
+.env.*
+dist
+apps/*/dist
+coverage
+*.tsbuildinfo
+.DS_Store
+prompts
+npm-debug.log*

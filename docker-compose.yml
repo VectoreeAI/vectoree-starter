@@ -1,0 +1,30 @@
+services:
+  server:
+    image: vectoree-starter-server:latest
+    container_name: vectoree-starter-server
+    restart: unless-stopped
+    build:
+      context: .
+      target: server
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+    volumes:
+      - ./.vectoree:/app/.vectoree
+
+  web:
+    image: vectoree-starter-web:latest
+    container_name: vectoree-starter-web
+    restart: unless-stopped
+    build:
+      context: .
+      target: web
+    environment:
+      API_PROXY: http://server:8787
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      - server

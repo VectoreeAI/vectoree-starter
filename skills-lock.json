@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "vectoree": {
+      "source": "VectoreeAI/vectoree-skills",
+      "sourceType": "github",
+      "skillPath": "skills/vectoree/SKILL.md",
+      "computedHash": "a0555a13b385329f45238d00ceeff34bb20b209df323d5dc1eed351d7e328f69"
+    }
+  }
+}
