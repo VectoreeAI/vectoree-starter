@@ -1,4 +1,4 @@
-# GitLab CI：MR 只测试；push dev 部署测试环境；push main 部署生产，并把 main 推到 GitHub。
+# GitLab CI：MR 只测试；push dev 部署测试环境；push main 先备份再部署生产，并把 main 推到 GitHub。
 # GitHub 只收 main。需要 CI 变量 GITHUB_TOKEN（Masked、Protected，环境范围 All）。
 #
 # 镜像（GitLab Container Registry）：
@@ -34,8 +34,45 @@ variables:
   STARTER_WEB_IMAGE_SHA: ${CI_REGISTRY_IMAGE}/web:${CI_COMMIT_SHA}
 
 stages:
+  - .pre
   - check
   - deploy
+
+# 合并进 main 之后，流水线第一步把合并前的 main 合并进 main-backup。
+# CI_COMMIT_BEFORE_SHA 是这次推送之前的 main。备份成功后才部署、推 GitHub。
+# 需要在 GitLab：Settings → CI/CD → Job token permissions 里允许本仓库用 CI_JOB_TOKEN 推送。
+backup_main:
+  stage: .pre
+  image: alpine:3.21
+  interruptible: false
+  resource_group: starter-main-backup
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - apk add --no-cache git ca-certificates
+  script:
+    - |
+      set -euo pipefail
+      before="${CI_COMMIT_BEFORE_SHA:-}"
+      empty="0000000000000000000000000000000000000000"
+      if [[ -z "$before" || "$before" == "$empty" ]]; then
+        echo "No previous main commit to back up."
+        exit 0
+      fi
+      git config user.email "${GITLAB_USER_EMAIL:-ci@vectoree.space}"
+      git config user.name "${GITLAB_USER_NAME:-GitLab CI}"
+      git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git fetch origin "$before"
+      if git fetch origin refs/heads/main-backup; then
+        git checkout -B main-backup FETCH_HEAD
+        git merge --no-edit --allow-unrelated-histories "$before" -m "chore: backup main before release"
+      else
+        git checkout -B main-backup "$before"
+      fi
+      git push origin HEAD:refs/heads/main-backup
+      echo "main-backup updated from ${before}"
 
 test:
   stage: check
@@ -173,6 +210,9 @@ deploy_development:
 
 deploy_production:
   extends: .deploy
+  needs:
+    - test
+    - backup_main
   resource_group: starter-production-deploy
   environment:
     name: production
@@ -189,6 +229,7 @@ publish_github:
   interruptible: false
   needs:
     - test
+    - backup_main
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
   variables:
