@@ -4,7 +4,7 @@ import { defineConfig } from 'vite';
 
 const apiProxy = process.env.API_PROXY || process.env.VITE_API_PROXY || 'http://127.0.0.1:8787';
 
-const publicHosts = ['vectoree.net', 'www.vectoree.net'];
+const publicHosts = ['vectoree.net', 'www.vectoree.net', 'vectoree.ai', 'www.vectoree.ai'];
 
 const starterApi = {
   '/starter/api': {
