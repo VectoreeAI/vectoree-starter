@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { resendCode, startEmailAuth, verifyEmail, type EmailStartResult, type PublicUser } from '../api';
+import { ApiError, resendCode, startEmailAuth, verifyEmail, type EmailStartResult, type PublicUser } from '../api';
 import { useI18n } from '../i18n';
 import { LocaleSwitch, VectoreeLockup } from '../ui';
 
@@ -24,6 +24,7 @@ export function AuthScreen({
   const [email, setEmail] = useState('');
   const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
+  const [errorCode, setErrorCode] = useState('');
   const [notice, setNotice] = useState('');
   const [pending, setPending] = useState(false);
   const [resendAt, setResendAt] = useState(0);
@@ -88,6 +89,7 @@ export function AuthScreen({
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     setError('');
+    setErrorCode('');
     setNotice('');
     const address = email.trim();
     if (!address) return;
@@ -104,17 +106,17 @@ export function AuthScreen({
           showCodeStep();
           return;
         }
-        setError(result.message || t('authFail'));
+        showError(result.message || t('authFail'));
         return;
       }
       if (step === 'code') {
         const result = await verifyEmail({ email: address, otp });
         if (result.user) onSignedIn(result.user);
-        else setError(result.message || t('verifyFail'));
+        else showError(result.message || t('verifyFail'));
         return;
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('authFail'));
+      showError(err instanceof Error ? err.message : t('authFail'), err);
     } finally {
       setPending(false);
     }
@@ -123,6 +125,7 @@ export function AuthScreen({
   async function onResend() {
     if (resendWait > 0) return;
     setError('');
+    setErrorCode('');
     setNotice('');
     setPending(true);
     try {
@@ -130,10 +133,15 @@ export function AuthScreen({
       setNotice(t('resentOk'));
       setResendAt(Date.now() + CODE_WAIT_MS);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('resendFail'));
+      showError(err instanceof Error ? err.message : t('resendFail'), err);
     } finally {
       setPending(false);
     }
+  }
+
+  function showError(message: string, err?: unknown) {
+    setErrorCode(err instanceof ApiError ? err.code ?? '' : '');
+    setError(message);
   }
 
   const stepTitle = step === 'code' ? t('checkEmail') : '';
@@ -210,7 +218,7 @@ export function AuthScreen({
           ) : null}
           {error ? (
             <div className="error" role="alert">
-              {walletNotActivated(error) ? (
+              {errorCode === 'BILLING_WALLET_NOT_ACTIVATED' ? (
                 <p>
                   {t('walletActivateBefore')}
                   <a href={billingHref(returnHref)}>{t('walletActivateLink')}</a>
@@ -270,11 +278,6 @@ function ArrowLeft() {
 
 function billingHref(dashboardHref: string): string {
   return `${dashboardHref.replace(/\/$/, '')}/organization/billing`;
-}
-
-function walletNotActivated(message: string): boolean {
-  const text = message.toLowerCase();
-  return text.includes('wallet is not activated') || text.includes('billing_wallet_not_activated');
 }
 
 function isSignedIn(result: EmailStartResult): result is { next: 'signed-in'; user: PublicUser } {

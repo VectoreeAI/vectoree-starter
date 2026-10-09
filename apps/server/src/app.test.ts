@@ -2043,6 +2043,78 @@ describe('preview auth', () => {
     assert.equal(text.includes(secret), false);
   });
 
+  it('retries a transient wallet-not-activated response and still sends the code', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0],
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1) {
+          return Response.json(
+            { code: 'BILLING_WALLET_NOT_ACTIVATED', message: 'Organization wallet is not activated' },
+            { status: 402 },
+          );
+        }
+        return Response.json({
+          user: { id: 'app-user', email: 'funded@example.com' },
+          requireEmailVerification: true,
+        });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'funded@example.com' });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(text), { next: 'code' });
+    assert.equal(calls, 2);
+    assert.equal(text.includes('wallet is not activated'), false);
+  });
+
+  it('reports an inactive wallet only after the same 402 keeps coming back', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0, 0],
+      fetchImpl: (async () => {
+        calls += 1;
+        return Response.json({ message: 'Organization wallet is not activated' }, { status: 402 });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'empty@example.com' });
+    const body = (await res.json()) as { message?: string; code?: string };
+    assert.equal(res.status, 402);
+    assert.equal(body.message, 'Organization wallet is not activated');
+    assert.equal(body.code, 'BILLING_WALLET_NOT_ACTIVATED');
+    assert.equal(calls, 3);
+  });
+
+  it('does not retry a wallet sentence that is not a 402', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0, 0],
+      fetchImpl: (async () => {
+        calls += 1;
+        return Response.json({ message: 'Organization wallet is not activated' }, { status: 503 });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'funded@example.com' });
+    const body = (await res.json()) as { message?: string; code?: string };
+    assert.equal(res.status, 503);
+    assert.equal(body.message, 'Organization wallet is not activated');
+    assert.equal(body.code, undefined);
+    assert.equal(calls, 1);
+  });
+
   it('rejects an empty email before calling upstream', async () => {
     const app = linkedApp((async () => {
       throw new Error('must not reach Vectoree');
