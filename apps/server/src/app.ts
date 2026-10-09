@@ -40,6 +40,8 @@ export type AppDeps = {
   fetchImpl?: typeof fetch;
   openUrl?: (url: string) => Promise<void>;
   connectTimeoutMs?: number;
+  /** Delays before retrying a transient "wallet not activated" auth failure. */
+  walletRetryDelaysMs?: number[];
 };
 
 const AUTH_PATHS = {
@@ -52,6 +54,8 @@ const AUTH_PATHS = {
 type AuthAction = keyof typeof AUTH_PATHS;
 
 const CODE_WAIT_MS = 60_000;
+/** A funded wallet can still return this once. Wait and retry before telling the user to top up. */
+const WALLET_RETRY_DELAYS_MS = [4_000, 8_000, 16_000];
 const lastCodeSentAt = new Map<string, number>();
 const bridgePasswords = new Map<string, string>();
 
@@ -282,6 +286,47 @@ export function createApp(deps: AppDeps): Hono {
   return app;
 }
 
+type AuthAttempt = { ok: boolean; status: number; data: unknown };
+
+async function postAuthUntilWalletReady(
+  fetchImpl: typeof fetch,
+  config: ProjectScope,
+  path: string,
+  body: Record<string, string>,
+  delays: number[],
+): Promise<AuthAttempt> {
+  let attempt = await postAuth(fetchImpl, config, path, body);
+  for (const delay of delays) {
+    if (!isWalletInactiveResponse(attempt.status, attempt.data)) return attempt;
+    await delayMs(delay);
+    attempt = await postAuth(fetchImpl, config, path, body);
+  }
+  return attempt;
+}
+
+async function postAuth(
+  fetchImpl: typeof fetch,
+  config: ProjectScope,
+  path: string,
+  body: Record<string, string>,
+): Promise<AuthAttempt> {
+  const response = await vectoreeFetch(fetchImpl, config, path, { method: 'POST', body: JSON.stringify(body) });
+  return { ok: response.ok, status: response.status, data: await readJsonSafe(response) };
+}
+
+/** Only a 402 with this code or sentence. A funded wallet can still return it once. */
+function isWalletInactiveResponse(status: number, data: unknown): boolean {
+  if (status !== 402) return false;
+  const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+  const code = typeof record.code === 'string' ? record.code : typeof record.error === 'string' ? record.error : '';
+  if (code === 'BILLING_WALLET_NOT_ACTIVATED') return true;
+  return readErrorMessage(data, '').toLowerCase().includes('wallet is not activated');
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function startEmailAuth(c: Context, deps: AppDeps): Promise<Response> {
   const config = requireLinked(c, deps.root, deps.env ?? process.env);
   const record = await readRecord(c);
@@ -289,25 +334,31 @@ async function startEmailAuth(c: Context, deps: AppDeps): Promise<Response> {
   if (!email) throw new ConfigError('email is required');
   const password = randomBytes(24).toString('base64url');
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const registered = await vectoreeFetch(fetchImpl, config, `${AUTH_PATHS.register}?client_type=server`, {
-    method: 'POST',
-    body: JSON.stringify({ email, password }),
-  });
-  const registeredData = await readJsonSafe(registered);
+  const delays = deps.walletRetryDelaysMs ?? WALLET_RETRY_DELAYS_MS;
+  const registered = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.register}?client_type=server`, { email, password }, delays);
+  const registeredData = registered.data;
   if (isEmailTaken(registered.status, registeredData)) {
-    const resent = await vectoreeFetch(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-    const resentData = await readJsonSafe(resent);
+    const resent = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, { email }, delays);
+    if (isWalletInactiveResponse(resent.status, resent.data)) return walletInactive(c, resent.data);
     if (!resent.ok) {
-      return c.json({ message: readErrorMessage(resentData, 'Could not resend the code') }, statusOf(resent.status));
+      return c.json({ message: readErrorMessage(resent.data, 'Could not resend the code') }, statusOf(resent.status));
     }
     noteCodeSent(email);
     return c.json({ next: 'code' });
   }
+  if (isWalletInactiveResponse(registered.status, registeredData)) return walletInactive(c, registeredData);
   rememberBridgePassword(email, password);
   return finishEmailAuth(c, config, email, registered.status, registeredData);
+}
+
+function walletInactive(c: Context, data: unknown): Response {
+  return c.json(
+    {
+      code: 'BILLING_WALLET_NOT_ACTIVATED',
+      message: readErrorMessage(data, 'Organization wallet is not activated'),
+    },
+    402,
+  );
 }
 
 function finishEmailAuth(c: Context, config: ProjectScope, email: string, status: number, data: unknown): Response {
@@ -333,26 +384,58 @@ async function setAccountPassword(c: Context, deps: AppDeps): Promise<Response> 
   const record = await readRecord(c);
   const password = typeof record.password === 'string' ? record.password : '';
   const confirmPassword = typeof record.confirmPassword === 'string' ? record.confirmPassword : '';
+  const code = typeof record.code === 'string' ? record.code.trim() : '';
   if (password.length < 8) throw new ConfigError('Password must be at least 8 characters');
   if (password !== confirmPassword) throw new ConfigError('Passwords do not match');
+  const email = session.user.email.trim();
+  if (!email) throw new ConfigError('Sign in first', 401);
   const config = requireLinked(c, deps.root, deps.env ?? process.env);
-  const payload: { password: string; currentPassword?: string } = { password };
-  if (session.bridgePassword) payload.currentPassword = session.bridgePassword;
-  const upstream = await vectoreeFetch(
-    deps.fetchImpl ?? fetch,
-    config,
-    '/api/auth/password?client_type=server',
-    { method: 'POST', body: JSON.stringify(payload) },
-    session.accessToken,
-  );
-  const data = await readJsonSafe(upstream);
-  if (!upstream.ok) {
-    return c.json({ message: readErrorMessage(data, 'Could not save password') }, statusOf(upstream.status));
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  if (!/^\d{6}$/.test(code)) {
+    const sent = await vectoreeFetch(fetchImpl, config, '/api/auth/email/send-reset-password?client_type=server', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    const sentData = await readJsonSafe(sent);
+    if (!sent.ok) {
+      return c.json({ message: upstreamMessage(sentData, 'Could not email a reset code') }, statusOf(sent.status));
+    }
+    return c.json({ next: 'code' });
+  }
+  const exchanged = await vectoreeFetch(fetchImpl, config, '/api/auth/email/exchange-reset-password-token?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ email, code }),
+  });
+  const exchangedData = await readJsonSafe(exchanged);
+  if (!exchanged.ok) {
+    return c.json({ message: upstreamMessage(exchangedData, 'Could not verify the reset code') }, statusOf(exchanged.status));
+  }
+  const token = readResetToken(exchangedData);
+  if (!token) throw new ConfigError('Could not save password', 502);
+  const reset = await vectoreeFetch(fetchImpl, config, '/api/auth/email/reset-password?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ newPassword: password, otp: token }),
+  });
+  const resetData = await readJsonSafe(reset);
+  if (!reset.ok) {
+    return c.json({ message: upstreamMessage(resetData, 'Could not save password') }, statusOf(reset.status));
   }
   const next = { ...session };
   delete next.bridgePassword;
   updateSession(c, next);
   return c.json({ ok: true });
+}
+
+function readResetToken(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const token = (data as { token?: unknown }).token;
+  return typeof token === 'string' ? token : '';
+}
+
+function upstreamMessage(data: unknown, fallback: string): string {
+  const message = readErrorMessage(data, fallback);
+  if (message.includes('<') || message.startsWith('Cannot ')) return fallback;
+  return message;
 }
 
 async function proxyAuth(c: Context, deps: AppDeps, action: Exclude<AuthAction, 'register'>): Promise<Response> {

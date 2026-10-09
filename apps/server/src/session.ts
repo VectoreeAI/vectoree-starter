@@ -15,7 +15,7 @@ export type SessionRecord = {
   previewId?: string;
   /**
    * Server-only password created at registration. The visitor never sees it.
-   * It is sent as currentPassword the first time they choose their own password.
+   * Discarded after they set their own password.
    */
   bridgePassword?: string;
 };

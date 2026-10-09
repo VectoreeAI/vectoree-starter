@@ -127,8 +127,10 @@ export function startEmailAuth(email: string) {
   return request<EmailStartResult>('/api/auth/email/start', { method: 'POST', body: JSON.stringify({ email }) });
 }
 
-export function setAccountPassword(input: { password: string; confirmPassword: string }) {
-  return request<{ ok: boolean }>('/api/account/password', { method: 'POST', body: JSON.stringify(input) });
+export type PasswordSetResult = { next: 'code' } | { ok: true };
+
+export function setAccountPassword(input: { password: string; confirmPassword: string; code?: string }) {
+  return request<PasswordSetResult>('/api/account/password', { method: 'POST', body: JSON.stringify(input) });
 }
 
 export function loginAccount(input: { email: string; password: string }) {

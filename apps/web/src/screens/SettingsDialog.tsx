@@ -203,27 +203,46 @@ function AccountPanel({ email }: { email: string }) {
   const { t } = useI18n();
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [awaitingCode, setAwaitingCode] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+
+  function validatePassword(): boolean {
+    if (password.length < 8) {
+      setError(t('passwordTooShort'));
+      return false;
+    }
+    if (password !== confirmPassword) {
+      setError(t('passwordMismatch'));
+      return false;
+    }
+    return true;
+  }
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     setError('');
     setNotice('');
-    if (password.length < 8) {
-      setError(t('passwordTooShort'));
-      return;
-    }
-    if (password !== confirmPassword) {
-      setError(t('passwordMismatch'));
-      return;
-    }
+    if (!validatePassword()) return;
+    if (awaitingCode && code.trim().length !== 6) return;
     setBusy(true);
     try {
-      await setAccountPassword({ password, confirmPassword });
+      const result = await setAccountPassword({
+        password,
+        confirmPassword,
+        ...(awaitingCode ? { code: code.trim() } : {}),
+      });
+      if ('next' in result && result.next === 'code') {
+        setAwaitingCode(true);
+        setNotice(t('passwordCodeSent'));
+        return;
+      }
       setPassword('');
       setConfirmPassword('');
+      setCode('');
+      setAwaitingCode(false);
       setNotice(t('passwordSaved'));
     } catch (err) {
       setError(err instanceof Error ? err.message : t('passwordSaveFail'));
@@ -266,8 +285,22 @@ function AccountPanel({ email }: { email: string }) {
               onChange={(event) => setConfirmPassword(event.target.value)}
             />
           </label>
+          {awaitingCode ? (
+            <label className="field-label">
+              <span className="sr-only">{t('passwordCode')}</span>
+              <input
+                className="field"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                placeholder={t('passwordCode')}
+                value={code}
+                onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              />
+            </label>
+          ) : null}
           <div className="account-save">
-            <button className="btn" type="submit" disabled={busy || !password || !confirmPassword}>
+            <button className="btn" type="submit" disabled={busy || !password || !confirmPassword || (awaitingCode && code.length !== 6)}>
               {busy ? t('saving') : t('save')}
             </button>
           </div>
