@@ -2073,44 +2073,77 @@ describe('preview auth', () => {
     assert.equal(verificationSends, 0);
   });
 
-  it('sets a password with the signed-in user token and the hidden registration password', async () => {
-    let registrationPassword = '';
-    const passwordCall: { auth: string; body: { password?: string; currentPassword?: string } } = { auth: '', body: {} };
+  it('emails a reset code, then saves the password with the project key', async () => {
+    const calls: Array<{ path: string; auth: string; body: Record<string, string> }> = [];
     const app = linkedApp((async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
-      const payload = init?.body ? (JSON.parse(String(init.body)) as { password?: string; currentPassword?: string }) : {};
+      const payload = init?.body ? (JSON.parse(String(init.body)) as Record<string, string>) : {};
+      calls.push({ path: url.pathname, auth: new Headers(init?.headers).get('authorization') ?? '', body: payload });
       if (url.pathname === '/api/auth/users') {
-        registrationPassword = payload.password ?? '';
         return Response.json({
           user: { id: 'app-user', email: 'ready@example.com' },
           accessToken: 'app-access',
           refreshToken: 'app-refresh',
         });
       }
-      if (url.pathname === '/api/auth/password') {
-        passwordCall.auth = new Headers(init?.headers).get('authorization') ?? '';
-        passwordCall.body = payload;
-        return Response.json({ user: { id: 'app-user', email: 'ready@example.com' } });
-      }
+      if (url.pathname === '/api/auth/email/send-reset-password') return Response.json({ success: true }, { status: 202 });
+      if (url.pathname === '/api/auth/email/exchange-reset-password-token') return Response.json({ token: 'reset-token' });
+      if (url.pathname === '/api/auth/email/reset-password') return Response.json({ message: 'Password reset successfully' });
       return new Response('missing', { status: 404 });
     }) as typeof fetch);
 
     const started = await start(app, { email: 'ready@example.com' });
     const cookie = (started.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
-    const res = await app.request('/api/account/password', {
+    const pending = await app.request('/api/account/password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: cookie },
       body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret' }),
     });
-    const text = await res.text();
-    assert.equal(res.status, 200);
+    assert.equal(pending.status, 200);
+    assert.deepEqual(await pending.json(), { next: 'code' });
+
+    const saved = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret', code: '123456' }),
+    });
+    const text = await saved.text();
+    assert.equal(saved.status, 200);
     assert.deepEqual(JSON.parse(text), { ok: true });
-    assert.equal(passwordCall.auth, 'Bearer app-access');
-    assert.equal(passwordCall.body.password, 'chosen-secret');
-    assert.equal(passwordCall.body.currentPassword, registrationPassword);
+    const resetCalls = calls.filter((item) => item.path.startsWith('/api/auth/email/'));
+    assert.deepEqual(
+      resetCalls.map((item) => item.path),
+      ['/api/auth/email/send-reset-password', '/api/auth/email/exchange-reset-password-token', '/api/auth/email/reset-password'],
+    );
+    assert.ok(resetCalls.every((item) => item.auth === `Bearer ${secret}`));
+    assert.deepEqual(resetCalls[0]?.body, { email: 'ready@example.com' });
+    assert.deepEqual(resetCalls[1]?.body, { email: 'ready@example.com', code: '123456' });
+    assert.deepEqual(resetCalls[2]?.body, { newPassword: 'chosen-secret', otp: 'reset-token' });
     assert.equal(text.includes('chosen-secret'), false);
-    assert.equal(text.includes(registrationPassword), false);
+    assert.equal(text.includes('reset-token'), false);
     assert.equal(text.includes(secret), false);
+  });
+
+  it('hides an upstream HTML error when the reset email cannot be sent', async () => {
+    const app = linkedApp((async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/auth/email/send-reset-password') {
+        return new Response('<html><pre>Cannot POST /api/auth/password</pre></html>', {
+          status: 404,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      return new Response('missing', { status: 404 });
+    }) as typeof fetch);
+    const sid = seedSession({ user: { id: 'app-user', email: 'ready@example.com' }, accessToken: 'app-access' });
+    const res = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `${SESSION_COOKIE}=${sid}` },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret' }),
+    });
+    const body = (await res.json()) as { message?: string };
+    assert.equal(res.status, 404);
+    assert.equal(body.message, 'Could not email a reset code');
   });
 
   it('rejects a password that does not match its confirmation', async () => {

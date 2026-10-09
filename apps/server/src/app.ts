@@ -333,26 +333,58 @@ async function setAccountPassword(c: Context, deps: AppDeps): Promise<Response> 
   const record = await readRecord(c);
   const password = typeof record.password === 'string' ? record.password : '';
   const confirmPassword = typeof record.confirmPassword === 'string' ? record.confirmPassword : '';
+  const code = typeof record.code === 'string' ? record.code.trim() : '';
   if (password.length < 8) throw new ConfigError('Password must be at least 8 characters');
   if (password !== confirmPassword) throw new ConfigError('Passwords do not match');
+  const email = session.user.email.trim();
+  if (!email) throw new ConfigError('Sign in first', 401);
   const config = requireLinked(c, deps.root, deps.env ?? process.env);
-  const payload: { password: string; currentPassword?: string } = { password };
-  if (session.bridgePassword) payload.currentPassword = session.bridgePassword;
-  const upstream = await vectoreeFetch(
-    deps.fetchImpl ?? fetch,
-    config,
-    '/api/auth/password?client_type=server',
-    { method: 'POST', body: JSON.stringify(payload) },
-    session.accessToken,
-  );
-  const data = await readJsonSafe(upstream);
-  if (!upstream.ok) {
-    return c.json({ message: readErrorMessage(data, 'Could not save password') }, statusOf(upstream.status));
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  if (!/^\d{6}$/.test(code)) {
+    const sent = await vectoreeFetch(fetchImpl, config, '/api/auth/email/send-reset-password?client_type=server', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    const sentData = await readJsonSafe(sent);
+    if (!sent.ok) {
+      return c.json({ message: upstreamMessage(sentData, 'Could not email a reset code') }, statusOf(sent.status));
+    }
+    return c.json({ next: 'code' });
+  }
+  const exchanged = await vectoreeFetch(fetchImpl, config, '/api/auth/email/exchange-reset-password-token?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ email, code }),
+  });
+  const exchangedData = await readJsonSafe(exchanged);
+  if (!exchanged.ok) {
+    return c.json({ message: upstreamMessage(exchangedData, 'Could not verify the reset code') }, statusOf(exchanged.status));
+  }
+  const token = readResetToken(exchangedData);
+  if (!token) throw new ConfigError('Could not save password', 502);
+  const reset = await vectoreeFetch(fetchImpl, config, '/api/auth/email/reset-password?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ newPassword: password, otp: token }),
+  });
+  const resetData = await readJsonSafe(reset);
+  if (!reset.ok) {
+    return c.json({ message: upstreamMessage(resetData, 'Could not save password') }, statusOf(reset.status));
   }
   const next = { ...session };
   delete next.bridgePassword;
   updateSession(c, next);
   return c.json({ ok: true });
+}
+
+function readResetToken(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const token = (data as { token?: unknown }).token;
+  return typeof token === 'string' ? token : '';
+}
+
+function upstreamMessage(data: unknown, fallback: string): string {
+  const message = readErrorMessage(data, fallback);
+  if (message.includes('<') || message.startsWith('Cannot ')) return fallback;
+  return message;
 }
 
 async function proxyAuth(c: Context, deps: AppDeps, action: Exclude<AuthAction, 'register'>): Promise<Response> {
