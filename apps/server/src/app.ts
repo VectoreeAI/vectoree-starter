@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
@@ -18,7 +19,7 @@ import { mountStorage } from './storage.js';
 import { createImageToolResponse } from './image-tool.js';
 import { createPreview, readPreview } from './preview.js';
 import { cloudApiUrl, parseTicket, redeemTicket, resolveScope, type ProjectScope } from './scope.js';
-import { createSession, destroySession, readSession } from './session.js';
+import { createSession, destroySession, readSession, updateSession } from './session.js';
 import {
   buildChatMessages,
   FALLBACK_MODEL,
@@ -30,6 +31,7 @@ import {
   readSessionTokens,
   toClientAuthBody,
   type ChatTurn,
+  type PublicUser,
 } from './vectoree.js';
 
 export type AppDeps = {
@@ -48,6 +50,15 @@ const AUTH_PATHS = {
 } as const;
 
 type AuthAction = keyof typeof AUTH_PATHS;
+
+const CODE_WAIT_MS = 60_000;
+const lastCodeSentAt = new Map<string, number>();
+const bridgePasswords = new Map<string, string>();
+
+export function clearAuthCooldowns(): void {
+  lastCodeSentAt.clear();
+  bridgePasswords.clear();
+}
 
 const LINK_ONLY_PATHS = [
   '/api/setup',
@@ -105,7 +116,7 @@ export function createApp(deps: AppDeps): Hono {
         linked: false,
         mode: 'cloud',
         previewed: Boolean(preview),
-        ...(preview ? { projectId: preview.projectId } : {}),
+        ...(preview ? { projectId: preview.projectId, apiUrl: preview.apiUrl } : {}),
       });
     }
     const config = resolveConfig(deps.root, env);
@@ -209,7 +220,7 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(data ?? { codeLength: 8 });
   });
 
-  app.post('/api/auth/register', (c) => proxyAuth(c, deps, 'register'));
+  app.post('/api/auth/email/start', (c) => startEmailAuth(c, deps));
   app.post('/api/auth/login', (c) => proxyAuth(c, deps, 'login'));
   app.post('/api/auth/verify', (c) => proxyAuth(c, deps, 'verify'));
   app.post('/api/auth/resend', (c) => proxyAuth(c, deps, 'resend'));
@@ -217,6 +228,8 @@ export function createApp(deps: AppDeps): Hono {
     destroySession(c);
     return c.json({ ok: true });
   });
+
+  app.post('/api/account/password', (c) => setAccountPassword(c, deps));
 
   app.get('/api/models', async (c) => {
     const config = requireLinked(c, deps.root, env);
@@ -269,36 +282,163 @@ export function createApp(deps: AppDeps): Hono {
   return app;
 }
 
-async function proxyAuth(c: Context, deps: AppDeps, action: AuthAction): Promise<Response> {
+async function startEmailAuth(c: Context, deps: AppDeps): Promise<Response> {
   const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const record = await readRecord(c);
+  const email = typeof record.email === 'string' ? record.email.trim() : '';
+  if (!email) throw new ConfigError('email is required');
+  const password = randomBytes(24).toString('base64url');
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const registered = await vectoreeFetch(fetchImpl, config, `${AUTH_PATHS.register}?client_type=server`, {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+  const registeredData = await readJsonSafe(registered);
+  if (isEmailTaken(registered.status, registeredData)) {
+    const resent = await vectoreeFetch(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    const resentData = await readJsonSafe(resent);
+    if (!resent.ok) {
+      return c.json({ message: readErrorMessage(resentData, 'Could not resend the code') }, statusOf(resent.status));
+    }
+    noteCodeSent(email);
+    return c.json({ next: 'code' });
+  }
+  rememberBridgePassword(email, password);
+  return finishEmailAuth(c, config, email, registered.status, registeredData);
+}
+
+function finishEmailAuth(c: Context, config: ProjectScope, email: string, status: number, data: unknown): Response {
+  const clientBody = toClientAuthBody(status, data);
+  const awaitingCode = 'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  if (awaitingCode) {
+    noteCodeSent(email);
+    return c.json({ next: 'code' });
+  }
+  const tokens = readSessionTokens(data);
+  const user = readPublicUser(data);
+  if (clientBody.httpStatus === 200 && tokens && user) {
+    openSession(c, config, email, user, tokens);
+    return c.json({ next: 'signed-in', user });
+  }
+  bridgePasswords.delete(emailKey(email));
+  return c.json(clientBody.body, statusOf(clientBody.httpStatus));
+}
+
+async function setAccountPassword(c: Context, deps: AppDeps): Promise<Response> {
+  const session = readSession(c);
+  if (!session) throw new ConfigError('Sign in first', 401);
+  const record = await readRecord(c);
+  const password = typeof record.password === 'string' ? record.password : '';
+  const confirmPassword = typeof record.confirmPassword === 'string' ? record.confirmPassword : '';
+  if (password.length < 8) throw new ConfigError('Password must be at least 8 characters');
+  if (password !== confirmPassword) throw new ConfigError('Passwords do not match');
+  const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const payload: { password: string; currentPassword?: string } = { password };
+  if (session.bridgePassword) payload.currentPassword = session.bridgePassword;
+  const upstream = await vectoreeFetch(
+    deps.fetchImpl ?? fetch,
+    config,
+    '/api/auth/password?client_type=server',
+    { method: 'POST', body: JSON.stringify(payload) },
+    session.accessToken,
+  );
+  const data = await readJsonSafe(upstream);
+  if (!upstream.ok) {
+    return c.json({ message: readErrorMessage(data, 'Could not save password') }, statusOf(upstream.status));
+  }
+  const next = { ...session };
+  delete next.bridgePassword;
+  updateSession(c, next);
+  return c.json({ ok: true });
+}
+
+async function proxyAuth(c: Context, deps: AppDeps, action: Exclude<AuthAction, 'register'>): Promise<Response> {
+  const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const payload = sanitizeAuthBody(action, await readJson(c));
+  if (action === 'resend' && codeCoolingDown(payload.email)) {
+    return c.json({ message: 'Wait before requesting another code' }, 429);
+  }
   const upstream = await vectoreeFetch(deps.fetchImpl ?? fetch, config, `${AUTH_PATHS[action]}?client_type=server`, {
     method: 'POST',
-    body: JSON.stringify(sanitizeAuthBody(action, await readJson(c))),
+    body: JSON.stringify(payload),
   });
   const data = await readJsonSafe(upstream);
   if (action === 'resend') {
     if (!upstream.ok) {
       return c.json({ message: readErrorMessage(data, 'Could not resend the code') }, statusOf(upstream.status));
     }
+    noteCodeSent(payload.email);
     return c.json({ ok: true });
   }
   const clientBody = toClientAuthBody(upstream.status, data);
   const tokens = readSessionTokens(data);
   const user = readPublicUser(data);
-  const awaitingCode =
-    'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  const awaitingCode = 'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  if (awaitingCode && action === 'login') noteCodeSent(payload.email);
   if (clientBody.httpStatus === 200 && tokens && user && !awaitingCode) {
-    createSession(c, {
-      user,
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      ...(config.previewId ? { previewId: config.previewId } : {}),
-    });
+    openSession(c, config, payload.email, user, tokens);
   }
   return c.json(clientBody.body, statusOf(clientBody.httpStatus));
 }
 
-function sanitizeAuthBody(action: AuthAction, body: unknown): Record<string, string> {
+function noteCodeSent(email: string, now = Date.now()): void {
+  lastCodeSentAt.set(emailKey(email), now);
+}
+
+function emailKey(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function rememberBridgePassword(email: string, password: string): void {
+  bridgePasswords.set(emailKey(email), password);
+}
+
+function takeBridgePassword(email: string): string | undefined {
+  const key = emailKey(email);
+  const password = bridgePasswords.get(key);
+  if (password) bridgePasswords.delete(key);
+  return password;
+}
+
+function openSession(
+  c: Context,
+  config: ProjectScope,
+  email: string,
+  user: PublicUser,
+  tokens: { accessToken: string; refreshToken?: string },
+): void {
+  const bridgePassword = takeBridgePassword(email);
+  createSession(c, {
+    user,
+    accessToken: tokens.accessToken,
+    ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+    ...(config.previewId ? { previewId: config.previewId } : {}),
+    ...(bridgePassword ? { bridgePassword } : {}),
+  });
+}
+
+function codeCoolingDown(email: string, now = Date.now()): boolean {
+  const sentAt = lastCodeSentAt.get(emailKey(email));
+  return sentAt !== undefined && now - sentAt < CODE_WAIT_MS;
+}
+
+function isEmailTaken(status: number, data: unknown): boolean {
+  if (status !== 409 || !data || typeof data !== 'object') return false;
+  const record = data as Record<string, unknown>;
+  if (record.error === 'AUTH_EMAIL_EXISTS' || record.code === 'AUTH_EMAIL_EXISTS') return true;
+  const nested = record.error;
+  return Boolean(nested && typeof nested === 'object' && (nested as { code?: unknown }).code === 'AUTH_EMAIL_EXISTS');
+}
+
+async function readRecord(c: Context): Promise<Record<string, unknown>> {
+  const body = await readJson(c);
+  return body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+}
+
+function sanitizeAuthBody(action: Exclude<AuthAction, 'register'>, body: unknown): Record<string, string> {
   const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
   const email = typeof record.email === 'string' ? record.email.trim() : '';
   if (!email) throw new ConfigError('email is required');
@@ -310,11 +450,7 @@ function sanitizeAuthBody(action: AuthAction, body: unknown): Record<string, str
   if (action === 'resend') return { email };
   const password = typeof record.password === 'string' ? record.password : '';
   if (!password) throw new ConfigError('password is required');
-  const payload: Record<string, string> = { email, password };
-  if (action === 'register' && typeof record.name === 'string' && record.name.trim()) {
-    payload.name = record.name.trim();
-  }
-  return payload;
+  return { email, password };
 }
 
 function parseChatBody(body: unknown): {
@@ -378,12 +514,13 @@ async function vectoreeFetch(
   config: AppConfig & { apiKey: string },
   path: string,
   init: RequestInit,
+  bearer = config.apiKey,
 ) {
   try {
     return await fetchImpl(`${config.apiUrl}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${bearer}`,
         Accept: 'application/json',
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
       },

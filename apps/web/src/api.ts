@@ -121,8 +121,14 @@ export function getAuthMethods(): Promise<{ codeLength?: number; verifyEmailMeth
   return request('/api/auth/methods');
 }
 
-export function registerAccount(input: { email: string; password: string; name?: string }) {
-  return request<AuthResult>('/api/auth/register', { method: 'POST', body: JSON.stringify(input) });
+export type EmailStartResult = { next: 'code' } | { next: 'signed-in'; user: PublicUser } | { user: null; message?: string };
+
+export function startEmailAuth(email: string) {
+  return request<EmailStartResult>('/api/auth/email/start', { method: 'POST', body: JSON.stringify({ email }) });
+}
+
+export function setAccountPassword(input: { password: string; confirmPassword: string }) {
+  return request<{ ok: boolean }>('/api/account/password', { method: 'POST', body: JSON.stringify(input) });
 }
 
 export function loginAccount(input: { email: string; password: string }) {

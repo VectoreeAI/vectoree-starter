@@ -3,11 +3,9 @@ import {
   createConversation,
   deleteConversation,
   renameConversation,
-  getBuckets,
   getModels,
   getSession,
   getSetupStatus,
-  getTables,
   listConversations,
   logoutAccount,
   PREVIEW_EXPIRED_EVENT,
@@ -20,17 +18,20 @@ import {
 } from './api';
 import { AuthScreen } from './screens/AuthScreen';
 import { ChatScreen } from './screens/ChatScreen';
-import { DatabaseScreen } from './screens/DatabaseScreen';
 import { SetupScreen } from './screens/SetupScreen';
 import { SettingsDialog } from './screens/SettingsDialog';
-import { StorageScreen } from './screens/StorageScreen';
 import { getLocale, translate, useI18n } from './i18n';
-import { Gear, Shell, Stage } from './ui';
+import { Gear, Shell, Stage, VeeMark } from './ui';
 
 type Gate = 'loading' | 'setup' | 'expired' | 'auth' | 'chat';
 
 /** The ticket is single use, so both StrictMode effect runs share one attempt. */
 let redeemAttempt: Promise<string> | null = null;
+
+function dashboardHref(apiUrl?: string): string {
+  const origin = (apiUrl || 'https://vectoree.ai').replace(/\/$/, '');
+  return `${origin}/dashboard`;
+}
 
 function redeemTicketOnce(ticket: string): Promise<string> {
   redeemAttempt ??= redeemPreview(ticket)
@@ -50,8 +51,8 @@ export function App() {
   const { t } = useI18n();
   const [gate, setGate] = useState<Gate>('loading');
   const [cloud, setCloud] = useState(false);
-  const [projectId, setProjectId] = useState<string | undefined>();
   const [projectName, setProjectName] = useState<string | undefined>();
+  const [apiUrl, setApiUrl] = useState<string | undefined>();
   const [user, setUser] = useState<PublicUser | null>(null);
   const [error, setError] = useState('');
 
@@ -86,8 +87,8 @@ export function App() {
             setGate('expired');
             return;
           }
-          setProjectId(status.projectId);
           setProjectName(status.projectName);
+          setApiUrl(status.apiUrl);
           const session = await getSession();
           if (cancelled) return;
           if (!session.user) {
@@ -102,8 +103,8 @@ export function App() {
           setGate('setup');
           return;
         }
-        setProjectId(status.projectId);
         setProjectName(status.projectName);
+        setApiUrl(status.apiUrl);
         const session = await getSession();
         if (cancelled) return;
         if (!session.user) {
@@ -126,9 +127,11 @@ export function App() {
   if (gate === 'loading') {
     return (
       <Shell>
-        <main className="stage">
-          <p className="eyebrow">{t('boot')}</p>
-          <h1 className="display">{t('checkingLink')}</h1>
+        <main className="boot">
+          <div className="boot-card" role="status" aria-live="polite">
+            <VeeMark face="thinking" animated title={t('checkingLink')} />
+            <p className="boot-caption">{t('checkingLink')}</p>
+          </div>
         </main>
       </Shell>
     );
@@ -160,7 +163,6 @@ export function App() {
             setError('');
             setGate('auth');
             void getSetupStatus().then((status) => {
-              setProjectId(status.projectId);
               setProjectName(status.projectName);
             });
           }}
@@ -171,14 +173,15 @@ export function App() {
 
   if (gate === 'auth' || !user) {
     return (
-      <Shell>
-        <AuthScreen
-          onSignedIn={(next) => {
-            setUser(next);
-            setGate('chat');
-          }}
-        />
-      </Shell>
+      <AuthScreen
+        templateName="vectoree starter"
+        subtitle={t('authSubtitle')}
+        returnHref={dashboardHref(apiUrl)}
+        onSignedIn={(next) => {
+          setUser(next);
+          setGate('chat');
+        }}
+      />
     );
   }
 
@@ -186,7 +189,7 @@ export function App() {
     <SignedIn
       user={user}
       cloud={cloud}
-      projectLabel={projectName || projectId}
+      projectName={projectName}
       onSignedOut={() => {
         setUser(null);
         setGate('auth');
@@ -198,31 +201,27 @@ export function App() {
 function SignedIn({
   user,
   cloud,
-  projectLabel,
+  projectName,
   onSignedOut,
 }: {
   user: PublicUser;
   cloud: boolean;
-  projectLabel?: string;
+  projectName?: string;
   onSignedOut: () => void;
 }) {
   const { t } = useI18n();
-  const [view, setView] = useState<'chat' | 'database' | 'storage'>('chat');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [navOpen, setNavOpen] = useState(() => {
+    try {
+      return localStorage.getItem('ve-starter-nav') !== 'closed';
+    } catch {
+      return true;
+    }
+  });
   const [models, setModels] = useState<ListedModel[]>([]);
   const [model, setModel] = useState('vectoree/auto');
   const [imageModel, setImageModel] = useState('');
   const [modelError, setModelError] = useState('');
-  const [tables, setTables] = useState<string[]>([]);
-  const [table, setTable] = useState<string | null>(null);
-  const [tablesReady, setTablesReady] = useState(false);
-  const [tableError, setTableError] = useState('');
-  const [reloadToken, setReloadToken] = useState(0);
-  const [buckets, setBuckets] = useState<string[]>([]);
-  const [bucket, setBucket] = useState<string | null>(null);
-  const [bucketsReady, setBucketsReady] = useState(false);
-  const [bucketError, setBucketError] = useState('');
-  const [storageReload, setStorageReload] = useState(0);
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [conversationError, setConversationError] = useState('');
@@ -231,52 +230,6 @@ function SignedIn({
   const skipRename = useRef(false);
 
   useEffect(() => {
-    if (view !== 'database') return undefined;
-    let cancelled = false;
-    setTablesReady(false);
-    void getTables()
-      .then((payload) => {
-        if (cancelled) return;
-        setTables(payload.tables);
-        setTable((current) => (current && payload.tables.includes(current) ? current : payload.tables[0] ?? null));
-        setTableError('');
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setTableError(err instanceof Error ? err.message : translate(getLocale(), 'listTablesFail'));
-      })
-      .finally(() => {
-        if (!cancelled) setTablesReady(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [view, reloadToken]);
-
-  useEffect(() => {
-    if (view !== 'storage') return undefined;
-    let cancelled = false;
-    setBucketsReady(false);
-    void getBuckets()
-      .then((payload) => {
-        if (cancelled) return;
-        const names = payload.buckets.map((item) => item.name);
-        setBuckets(names);
-        setBucket((current) => (current && names.includes(current) ? current : names[0] ?? null));
-        setBucketError('');
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setBucketError(err instanceof Error ? err.message : translate(getLocale(), 'listBucketsFail'));
-      })
-      .finally(() => {
-        if (!cancelled) setBucketsReady(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [view, storageReload]);
-
-  useEffect(() => {
-    if (view !== 'chat') return undefined;
     let cancelled = false;
     void listConversations()
       .then(async (payload) => {
@@ -301,7 +254,7 @@ function SignedIn({
     return () => {
       cancelled = true;
     };
-  }, [view]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -326,7 +279,6 @@ function SignedIn({
       const created = await createConversation(true);
       setConversations((current) => [created, ...current.filter((item) => item.id !== created.id)]);
       setConversationId(created.id);
-      setView('chat');
     } catch (err) {
       setConversationError(err instanceof Error ? err.message : translate(getLocale(), 'loadChatFail'));
     }
@@ -404,140 +356,116 @@ function SignedIn({
     onSignedOut();
   }
 
+  function toggleNav() {
+    setNavOpen((open) => {
+      const next = !open;
+      try {
+        localStorage.setItem('ve-starter-nav', next ? 'open' : 'closed');
+      } catch {
+        // private mode
+      }
+      return next;
+    });
+  }
+
   return (
     <Shell>
       <div className="workspace">
-        <aside className="sidebar">
+        <aside className={navOpen ? 'sidebar' : 'sidebar collapsed'}>
+          <button className="btn side-new" type="button" aria-label={t('newChat')} onClick={() => void onNewChat()}>
+            {navOpen ? t('newChat') : <PlusIcon />}
+          </button>
           <div className="side-nav">
-          <p className="eyebrow">{t('app')}</p>
-          <button className={view === 'chat' ? 'nav-btn active' : 'nav-btn'} type="button" onClick={() => void onNewChat()}>
-            {t('newChat')}
-          </button>
-          <button
-            className={view === 'database' ? 'nav-btn active' : 'nav-btn'}
-            type="button"
-            onClick={() => setView('database')}
-          >
-            {t('database')}
-          </button>
-          <button
-            className={view === 'storage' ? 'nav-btn active' : 'nav-btn'}
-            type="button"
-            onClick={() => setView('storage')}
-          >
-            {t('storage')}
-          </button>
-          <hr className="side-divider" />
-          {view === 'chat'
-            ? conversations.map((item) => (
-                <div key={item.id} className="side-convo">
-                  {editingId === item.id ? (
-                    <input
-                      className="side-rename"
-                      value={draftTitle}
-                      aria-label={chatTitle(item)}
-                      autoFocus
-                      onChange={(event) => setDraftTitle(event.target.value)}
-                      onBlur={() => void commitRename(item.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') {
-                          event.preventDefault();
-                          event.currentTarget.blur();
-                        }
-                        if (event.key === 'Escape') {
-                          event.preventDefault();
-                          skipRename.current = true;
-                          setEditingId(null);
-                        }
-                      }}
-                    />
-                  ) : (
-                    <button
-                      className={item.id === conversationId ? 'side-table active' : 'side-table'}
-                      type="button"
-                      onClick={() => setConversationId(item.id)}
-                      onDoubleClick={() => startRename(item)}
-                    >
-                      {chatTitle(item)}
-                    </button>
-                  )}
-                  <button className="side-x" type="button" aria-label={t('delete')} onClick={() => void onDeleteChat(item.id)}>
-                    ×
+            {navOpen ? <p className="eyebrow side-label">{t('history')}</p> : null}
+            {conversations.map((item) =>
+              navOpen ? (
+              <div key={item.id} className="side-convo">
+                {editingId === item.id ? (
+                  <input
+                    className="side-rename"
+                    value={draftTitle}
+                    aria-label={chatTitle(item)}
+                    autoFocus
+                    onChange={(event) => setDraftTitle(event.target.value)}
+                    onBlur={() => void commitRename(item.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        event.currentTarget.blur();
+                      }
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        skipRename.current = true;
+                        setEditingId(null);
+                      }
+                    }}
+                  />
+                ) : (
+                  <button
+                    className={item.id === conversationId ? 'side-chat active' : 'side-chat'}
+                    type="button"
+                    onClick={() => setConversationId(item.id)}
+                    onDoubleClick={() => startRename(item)}
+                  >
+                    {chatTitle(item)}
                   </button>
-                </div>
-              ))
-            : null}
-          {view === 'database'
-            ? tables.map((name) => (
-                <button
-                  key={name}
-                  className={name === table ? 'side-table active' : 'side-table'}
-                  type="button"
-                  onClick={() => setTable(name)}
-                >
-                  {name}
+                )}
+                <button className="side-x" type="button" aria-label={t('delete')} onClick={() => void onDeleteChat(item.id)}>
+                  <CloseGlyph />
                 </button>
-              ))
-            : null}
-          {view === 'storage'
-            ? buckets.map((name) => (
+              </div>
+              ) : (
                 <button
-                  key={name}
-                  className={name === bucket ? 'side-table active' : 'side-table'}
+                  key={item.id}
+                  className={item.id === conversationId ? 'side-chat-icon active' : 'side-chat-icon'}
                   type="button"
-                  onClick={() => setBucket(name)}
+                  aria-label={chatTitle(item)}
+                  title={chatTitle(item)}
+                  onClick={() => setConversationId(item.id)}
                 >
-                  {name}
+                  <ChatMark />
                 </button>
-              ))
-            : null}
-          {view === 'chat' && conversationError ? <p className="note">{conversationError}</p> : null}
-          {view === 'database' && tableError ? <p className="note">{tableError}</p> : null}
-          {view === 'storage' && bucketError ? <p className="note">{bucketError}</p> : null}
-          {modelError ? <p className="note">{modelError}</p> : null}
+              ),
+            )}
+            {navOpen && conversationError ? <p className="note">{conversationError}</p> : null}
+            {navOpen && modelError ? <p className="note">{modelError}</p> : null}
           </div>
-          <div className="side-foot">
-            <button className="nav-btn with-icon" type="button" onClick={() => setSettingsOpen(true)}>
-              <Gear />
-              {t('settings')}
+          <div className="side-dock">
+            <button
+              className="side-fold"
+              type="button"
+              aria-label={navOpen ? t('collapseNav') : t('expandNav')}
+              title={navOpen ? t('collapseNav') : t('expandNav')}
+              onClick={toggleNav}
+            >
+              <PanelToggle open={navOpen} />
+              {navOpen ? t('collapseNav') : null}
             </button>
-            <div className="side-account">
-              <p className="mono">{projectLabel || t('linked')}</p>
-              <p className="mono">{user.email}</p>
-              <button className="btn" type="button" onClick={() => void onLogout()}>
-                {t('logout')}
-              </button>
-            </div>
+            <UserChip
+            navOpen={navOpen}
+            email={user.email}
+            projectName={projectName}
+            onSettings={() => setSettingsOpen(true)}
+            onLogout={() => void onLogout()}
+            />
           </div>
         </aside>
         <div className="workspace-main">
-          {view === 'chat' ? (
-            <ChatScreen
-              conversationId={conversationId}
-              titledByModel={Boolean(conversations.find((item) => item.id === conversationId)?.titledByModel)}
-              models={models}
-              model={model}
-              imageModel={imageModel}
-              onDatabase={() => setReloadToken((current) => current + 1)}
-              onStorage={() => setStorageReload((current) => current + 1)}
-              onTitled={onTitled}
-              onSaved={onSaved}
-            />
-          ) : view === 'database' ? (
-            <DatabaseScreen table={table} ready={tablesReady} reloadToken={reloadToken} />
-          ) : (
-            <StorageScreen
-              bucket={bucket}
-              ready={bucketsReady}
-              reloadToken={storageReload}
-              onChanged={() => setStorageReload((current) => current + 1)}
-            />
-          )}
+          <ChatScreen
+            conversationId={conversationId}
+            titledByModel={Boolean(conversations.find((item) => item.id === conversationId)?.titledByModel)}
+            models={models}
+            model={model}
+            imageModel={imageModel}
+            onTitled={onTitled}
+            onSaved={onSaved}
+          />
         </div>
       </div>
       {settingsOpen ? (
         <SettingsDialog
           cloud={cloud}
+          email={user.email}
           models={models}
           model={model}
           imageModel={imageModel}
@@ -547,5 +475,203 @@ function SignedIn({
         />
       ) : null}
     </Shell>
+  );
+}
+
+const DOCS_URL = 'https://docs.vectoree.ai/introduction';
+const FEEDBACK_URL = 'https://vectoree.ai/dashboard/feedback';
+
+function UserChip({
+  navOpen,
+  email,
+  projectName,
+  onSettings,
+  onLogout,
+}: {
+  navOpen: boolean;
+  email: string;
+  projectName?: string;
+  onSettings: () => void;
+  onLogout: () => void;
+}) {
+  const { t } = useI18n();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [box, setBox] = useState<{ left: number; bottom: number; width: number } | null>(null);
+  const title = projectName || email;
+  const initial = (email.trim()[0] || title.trim()[0] || '?').toUpperCase();
+
+  function place() {
+    const node = rootRef.current;
+    if (!node) return;
+    const rect = node.getBoundingClientRect();
+    setBox({
+      left: rect.left,
+      bottom: window.innerHeight - rect.top + 8,
+      width: Math.max(rect.width, 208),
+    });
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    place();
+    function onPointer(event: PointerEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === 'Escape') setOpen(false);
+    }
+    function onLayout() {
+      place();
+    }
+    document.addEventListener('pointerdown', onPointer);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onLayout);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onLayout);
+    };
+  }, [open, navOpen]);
+
+  return (
+    <div className="side-foot" ref={rootRef}>
+      <button
+        className="side-user"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={t('accountMenu')}
+        title={email}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+            return;
+          }
+          place();
+          setOpen(true);
+        }}
+      >
+        <span className="side-avatar" aria-hidden="true">
+          {initial}
+        </span>
+        {navOpen ? (
+          <span className="side-user-copy">
+            <span className="side-project-name">{title}</span>
+            {projectName ? <span className="mono side-email">{email}</span> : null}
+          </span>
+        ) : null}
+      </button>
+      {open && box ? (
+        <div className="side-menu" role="menu" style={{ left: box.left, bottom: box.bottom, width: box.width }}>
+          <button
+            className="side-menu-item"
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onSettings();
+            }}
+          >
+            <Gear />
+            {t('settings')}
+          </button>
+          <a className="side-menu-item" role="menuitem" href={DOCS_URL} target="_blank" rel="noopener noreferrer">
+            <BookIcon />
+            {t('docs')}
+          </a>
+          <a className="side-menu-item" role="menuitem" href={FEEDBACK_URL} target="_blank" rel="noopener noreferrer">
+            <FeedbackIcon />
+            {t('feedback')}
+          </a>
+          <div className="side-menu-split" />
+          <button
+            className="side-menu-item"
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onLogout();
+            }}
+          >
+            <LogoutIcon />
+            {t('logout')}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function BookIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M8 3.2c-1.5-.8-3.2-1-5.5-.6v9.3c2.3-.4 4-.2 5.5.6 1.5-.8 3.2-1 5.5-.6V2.6c-2.3-.4-4-.2-5.5.6z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+      <path d="M8 3.2v9.3" fill="none" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function FeedbackIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M2.2 2.8h11.6v7.2H6.1L2.2 13.1V2.8z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function ChatMark() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="2.25" y="2.25" width="11.5" height="11.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M5 6.25h6M5 9.75h4" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 3.25v9.5M3.25 8h9.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function PanelToggle({ open }: { open: boolean }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="1.5" y="2.5" width="13" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M6 2.5v11" stroke="currentColor" strokeWidth="1.8" />
+      <path d={open ? 'M11 6 L9 8 L11 10' : 'M9 6 L11 8 L9 10'} fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function LogoutIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M6 2.5H3.5v11H6" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M7 8h6.5M11 5.5L13.5 8 11 10.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function CloseGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+      <path d="M2 2l9 9M11 2L2 11" fill="none" stroke="currentColor" strokeWidth="2.4" />
+    </svg>
   );
 }
