@@ -21,8 +21,35 @@ describe('models', () => {
       ],
     });
     assert.equal(pickDefaultModel(models), 'vendor/vision');
+    assert.equal(models[0]?.chat, false);
+    assert.equal(models[1]?.chat, true);
     assert.equal(models[1]?.vision, true);
+    assert.equal(models[2]?.chat, true);
     assert.equal(models[0]?.vision, false);
+  });
+
+  it('keeps chat models to text output, including vision language models', () => {
+    const models = parseModelList({
+      data: [
+        { id: 'baai/bge', inputModality: ['text'], outputModality: ['embeddings'] },
+        { id: 'vendor/rerank', inputModality: ['text'], outputModality: ['rerank'] },
+        { id: 'black-forest-labs/flux.2', inputModality: ['text'], outputModality: ['image'] },
+        { id: 'bytedance/seedance', inputModality: ['text'], outputModality: ['video'] },
+        { id: 'alibaba/wan-2.7-t2v', inputModality: ['text'], outputModality: ['video'] },
+        { id: 'vendor/tts', inputModality: ['text'], outputModality: ['speech'] },
+        { id: 'vendor/omni', inputModality: ['text', 'image'], outputModality: ['text', 'image'] },
+        { id: 'amazon/nova-2-lite-v1', inputModality: ['text', 'image'], outputModality: ['text'] },
+        { id: 'arcee-ai/trinity', inputModality: ['text'], outputModality: ['Text'] },
+      ],
+    });
+    assert.deepEqual(
+      models.filter((model) => model.chat).map((model) => model.id),
+      ['amazon/nova-2-lite-v1', 'arcee-ai/trinity'],
+    );
+    assert.equal(models.find((model) => model.id === 'amazon/nova-2-lite-v1')?.vision, true);
+    assert.equal(models.find((model) => model.id === 'arcee-ai/trinity')?.vision, false);
+    assert.equal(pickDefaultModel(models), 'amazon/nova-2-lite-v1');
+    assert.equal(pickImageModel(models), 'black-forest-labs/flux.2');
   });
 
   it('falls back to vectoree/auto when the catalog is empty', () => {

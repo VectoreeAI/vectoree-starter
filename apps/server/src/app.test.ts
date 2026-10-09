@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
-import { createApp } from './app.js';
+import { clearAuthCooldowns, createApp } from './app.js';
 import { normalizeSchema, parseCreateTable } from './database.js';
 import { loadEnvFiles, normalizeApiUrl, publicSetupStatus, writeLinkedConfig, writeProjectConfig, deploymentMode } from './config.js';
 import { createImageToolResponse, normalizeGeneratedImages } from './image-tool.js';
@@ -20,6 +20,7 @@ function tempRoot(): string {
 }
 
 afterEach(() => {
+  clearAuthCooldowns();
   clearSessions();
   clearPreviews();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
@@ -1676,7 +1677,13 @@ describe('cloud preview', () => {
     const pid = seedPreview({ apiUrl: vectoree, apiKey: keyA, projectId: 'proj_a' });
     const res = await app.request('/api/setup/status', { headers: { Cookie: `${PREVIEW_COOKIE}=${pid}` } });
     const text = await res.text();
-    assert.deepEqual(JSON.parse(text), { linked: false, mode: 'cloud', previewed: true, projectId: 'proj_a' });
+    assert.deepEqual(JSON.parse(text), {
+      linked: false,
+      mode: 'cloud',
+      previewed: true,
+      projectId: 'proj_a',
+      apiUrl: vectoree,
+    });
     assert.equal(text.includes('sk-ve'), false);
   });
 
@@ -1821,10 +1828,10 @@ describe('cloud preview', () => {
       seen.length = 0;
       const cookie = previewCookie(key, projectId, userId);
       const json = { Cookie: cookie, 'Content-Type': 'application/json' };
-      const register = await app.request('/api/auth/register', {
+      const register = await app.request('/api/auth/email/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Cookie: cookie.split('; ')[0] ?? '' },
-        body: JSON.stringify({ email: 'new@example.com', password: 'pw-12345678', name: 'New' }),
+        body: JSON.stringify({ email: 'new@example.com' }),
       });
       assert.equal(register.status, 200);
       assert.equal((await app.request('/api/models', { headers: json })).status, 200);
@@ -1879,7 +1886,7 @@ describe('cloud preview', () => {
       ['GET', '/api/storage/buckets'],
       ['GET', '/api/conversations'],
       ['GET', '/api/auth/methods'],
-      ['POST', '/api/auth/register'],
+      ['POST', '/api/auth/email/start'],
       ['POST', '/api/chat'],
     ] as const) {
       const res = await app.request(route, {
@@ -1955,5 +1962,273 @@ describe('cloud preview', () => {
       body: JSON.stringify({ force: true }),
     });
     assert.equal(fs.existsSync(path.join(localRoot, '.vectoree', 'conversations', 'u1', 'index.json')), true);
+  });
+});
+
+describe('preview auth', () => {
+  function linkedApp(fetchImpl: typeof fetch) {
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    return createApp({ root, env: {}, fetchImpl });
+  }
+
+  function start(app: ReturnType<typeof createApp>, body: unknown) {
+    return app.request('/api/auth/email/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('creates an account from an email and does not send a second code', async () => {
+    const calls: string[] = [];
+    let bridgePassword = '';
+    const app = linkedApp((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push(url.pathname);
+      const payload = JSON.parse(String(init?.body)) as { password?: string };
+      bridgePassword = payload.password ?? '';
+      return Response.json({
+        user: { id: 'app-user', email: 'new@example.com' },
+        requireEmailVerification: true,
+        accessToken: null,
+      });
+    }) as typeof fetch);
+
+    const res = await start(app, { email: 'new@example.com' });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(text), { next: 'code' });
+    assert.deepEqual(calls, ['/api/auth/users']);
+    assert.equal(bridgePassword.length > 16, true);
+    assert.equal(text.includes(bridgePassword), false);
+    assert.equal(text.includes(secret), false);
+  });
+
+  it('resends the code when the email already has an account', async () => {
+    const calls: string[] = [];
+    const app = linkedApp((async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(url.pathname);
+      if (url.pathname === '/api/auth/users') {
+        return Response.json({ error: 'AUTH_EMAIL_EXISTS', message: 'Email already registered' }, { status: 409 });
+      }
+      return Response.json({ success: true }, { status: 202 });
+    }) as typeof fetch);
+
+    const res = await start(app, { email: 'known@example.com' });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(text), { next: 'code' });
+    assert.deepEqual(calls, ['/api/auth/users', '/api/auth/email/send-verification']);
+    assert.equal(text.includes('AUTH_EMAIL_EXISTS'), false);
+    assert.equal(text.includes(secret), false);
+  });
+
+  it('stores a session when the email is already verified', async () => {
+    const app = linkedApp((async () =>
+      Response.json({
+        user: { id: 'app-user', email: 'ready@example.com' },
+        accessToken: 'app-access',
+        refreshToken: 'app-refresh',
+      })) as typeof fetch);
+
+    const res = await start(app, { email: 'ready@example.com' });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(text), { next: 'signed-in', user: { id: 'app-user', email: 'ready@example.com' } });
+    assert.match(res.headers.get('set-cookie') ?? '', /ve_session=/);
+    assert.equal(text.includes('app-access'), false);
+    assert.equal(text.includes('app-refresh'), false);
+    assert.equal(text.includes(secret), false);
+  });
+
+  it('retries a transient wallet-not-activated response and still sends the code', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0],
+      fetchImpl: (async () => {
+        calls += 1;
+        if (calls === 1) {
+          return Response.json(
+            { code: 'BILLING_WALLET_NOT_ACTIVATED', message: 'Organization wallet is not activated' },
+            { status: 402 },
+          );
+        }
+        return Response.json({
+          user: { id: 'app-user', email: 'funded@example.com' },
+          requireEmailVerification: true,
+        });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'funded@example.com' });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(text), { next: 'code' });
+    assert.equal(calls, 2);
+    assert.equal(text.includes('wallet is not activated'), false);
+  });
+
+  it('reports an inactive wallet only after the same 402 keeps coming back', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0, 0],
+      fetchImpl: (async () => {
+        calls += 1;
+        return Response.json({ message: 'Organization wallet is not activated' }, { status: 402 });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'empty@example.com' });
+    const body = (await res.json()) as { message?: string; code?: string };
+    assert.equal(res.status, 402);
+    assert.equal(body.message, 'Organization wallet is not activated');
+    assert.equal(body.code, 'BILLING_WALLET_NOT_ACTIVATED');
+    assert.equal(calls, 3);
+  });
+
+  it('does not retry a wallet sentence that is not a 402', async () => {
+    let calls = 0;
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0, 0],
+      fetchImpl: (async () => {
+        calls += 1;
+        return Response.json({ message: 'Organization wallet is not activated' }, { status: 503 });
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'funded@example.com' });
+    const body = (await res.json()) as { message?: string; code?: string };
+    assert.equal(res.status, 503);
+    assert.equal(body.message, 'Organization wallet is not activated');
+    assert.equal(body.code, undefined);
+    assert.equal(calls, 1);
+  });
+
+  it('rejects an empty email before calling upstream', async () => {
+    const app = linkedApp((async () => {
+      throw new Error('must not reach Vectoree');
+    }) as typeof fetch);
+    const res = await start(app, { email: '   ' });
+    assert.equal(res.status, 400);
+    assert.equal(((await res.json()) as { message?: string }).message, 'email is required');
+  });
+
+  it('rejects a resend until 60 seconds after the code was sent', async () => {
+    let verificationSends = 0;
+    const app = linkedApp((async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/auth/email/send-verification') verificationSends += 1;
+      return Response.json({
+        user: { id: 'app-user', email: 'new@example.com' },
+        requireEmailVerification: true,
+      });
+    }) as typeof fetch);
+
+    assert.equal((await start(app, { email: 'new@example.com' })).status, 200);
+    const resend = await app.request('/api/auth/resend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'new@example.com' }),
+    });
+    assert.equal(resend.status, 429);
+    assert.equal(verificationSends, 0);
+  });
+
+  it('emails a reset code, then saves the password with the project key', async () => {
+    const calls: Array<{ path: string; auth: string; body: Record<string, string> }> = [];
+    const app = linkedApp((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const payload = init?.body ? (JSON.parse(String(init.body)) as Record<string, string>) : {};
+      calls.push({ path: url.pathname, auth: new Headers(init?.headers).get('authorization') ?? '', body: payload });
+      if (url.pathname === '/api/auth/users') {
+        return Response.json({
+          user: { id: 'app-user', email: 'ready@example.com' },
+          accessToken: 'app-access',
+          refreshToken: 'app-refresh',
+        });
+      }
+      if (url.pathname === '/api/auth/email/send-reset-password') return Response.json({ success: true }, { status: 202 });
+      if (url.pathname === '/api/auth/email/exchange-reset-password-token') return Response.json({ token: 'reset-token' });
+      if (url.pathname === '/api/auth/email/reset-password') return Response.json({ message: 'Password reset successfully' });
+      return new Response('missing', { status: 404 });
+    }) as typeof fetch);
+
+    const started = await start(app, { email: 'ready@example.com' });
+    const cookie = (started.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+    const pending = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret' }),
+    });
+    assert.equal(pending.status, 200);
+    assert.deepEqual(await pending.json(), { next: 'code' });
+
+    const saved = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret', code: '123456' }),
+    });
+    const text = await saved.text();
+    assert.equal(saved.status, 200);
+    assert.deepEqual(JSON.parse(text), { ok: true });
+    const resetCalls = calls.filter((item) => item.path.startsWith('/api/auth/email/'));
+    assert.deepEqual(
+      resetCalls.map((item) => item.path),
+      ['/api/auth/email/send-reset-password', '/api/auth/email/exchange-reset-password-token', '/api/auth/email/reset-password'],
+    );
+    assert.ok(resetCalls.every((item) => item.auth === `Bearer ${secret}`));
+    assert.deepEqual(resetCalls[0]?.body, { email: 'ready@example.com' });
+    assert.deepEqual(resetCalls[1]?.body, { email: 'ready@example.com', code: '123456' });
+    assert.deepEqual(resetCalls[2]?.body, { newPassword: 'chosen-secret', otp: 'reset-token' });
+    assert.equal(text.includes('chosen-secret'), false);
+    assert.equal(text.includes('reset-token'), false);
+    assert.equal(text.includes(secret), false);
+  });
+
+  it('hides an upstream HTML error when the reset email cannot be sent', async () => {
+    const app = linkedApp((async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/auth/email/send-reset-password') {
+        return new Response('<html><pre>Cannot POST /api/auth/password</pre></html>', {
+          status: 404,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      return new Response('missing', { status: 404 });
+    }) as typeof fetch);
+    const sid = seedSession({ user: { id: 'app-user', email: 'ready@example.com' }, accessToken: 'app-access' });
+    const res = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `${SESSION_COOKIE}=${sid}` },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'chosen-secret' }),
+    });
+    const body = (await res.json()) as { message?: string };
+    assert.equal(res.status, 404);
+    assert.equal(body.message, 'Could not email a reset code');
+  });
+
+  it('rejects a password that does not match its confirmation', async () => {
+    const app = linkedApp((async () => {
+      throw new Error('must not reach Vectoree');
+    }) as typeof fetch);
+    const sid = seedSession({ user: { id: 'app-user', email: 'ready@example.com' }, accessToken: 'app-access' });
+    const res = await app.request('/api/account/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `${SESSION_COOKIE}=${sid}` },
+      body: JSON.stringify({ password: 'chosen-secret', confirmPassword: 'other-secret' }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(((await res.json()) as { message?: string }).message, 'Passwords do not match');
   });
 });

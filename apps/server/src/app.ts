@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
@@ -18,7 +19,7 @@ import { mountStorage } from './storage.js';
 import { createImageToolResponse } from './image-tool.js';
 import { createPreview, readPreview } from './preview.js';
 import { cloudApiUrl, parseTicket, redeemTicket, resolveScope, type ProjectScope } from './scope.js';
-import { createSession, destroySession, readSession } from './session.js';
+import { createSession, destroySession, readSession, updateSession } from './session.js';
 import {
   buildChatMessages,
   FALLBACK_MODEL,
@@ -30,6 +31,7 @@ import {
   readSessionTokens,
   toClientAuthBody,
   type ChatTurn,
+  type PublicUser,
 } from './vectoree.js';
 
 export type AppDeps = {
@@ -38,6 +40,8 @@ export type AppDeps = {
   fetchImpl?: typeof fetch;
   openUrl?: (url: string) => Promise<void>;
   connectTimeoutMs?: number;
+  /** Delays before retrying a transient "wallet not activated" auth failure. */
+  walletRetryDelaysMs?: number[];
 };
 
 const AUTH_PATHS = {
@@ -48,6 +52,17 @@ const AUTH_PATHS = {
 } as const;
 
 type AuthAction = keyof typeof AUTH_PATHS;
+
+const CODE_WAIT_MS = 60_000;
+/** A funded wallet can still return this once. Wait and retry before telling the user to top up. */
+const WALLET_RETRY_DELAYS_MS = [4_000, 8_000, 16_000];
+const lastCodeSentAt = new Map<string, number>();
+const bridgePasswords = new Map<string, string>();
+
+export function clearAuthCooldowns(): void {
+  lastCodeSentAt.clear();
+  bridgePasswords.clear();
+}
 
 const LINK_ONLY_PATHS = [
   '/api/setup',
@@ -105,7 +120,7 @@ export function createApp(deps: AppDeps): Hono {
         linked: false,
         mode: 'cloud',
         previewed: Boolean(preview),
-        ...(preview ? { projectId: preview.projectId } : {}),
+        ...(preview ? { projectId: preview.projectId, apiUrl: preview.apiUrl } : {}),
       });
     }
     const config = resolveConfig(deps.root, env);
@@ -209,7 +224,7 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(data ?? { codeLength: 8 });
   });
 
-  app.post('/api/auth/register', (c) => proxyAuth(c, deps, 'register'));
+  app.post('/api/auth/email/start', (c) => startEmailAuth(c, deps));
   app.post('/api/auth/login', (c) => proxyAuth(c, deps, 'login'));
   app.post('/api/auth/verify', (c) => proxyAuth(c, deps, 'verify'));
   app.post('/api/auth/resend', (c) => proxyAuth(c, deps, 'resend'));
@@ -217,6 +232,8 @@ export function createApp(deps: AppDeps): Hono {
     destroySession(c);
     return c.json({ ok: true });
   });
+
+  app.post('/api/account/password', (c) => setAccountPassword(c, deps));
 
   app.get('/api/models', async (c) => {
     const config = requireLinked(c, deps.root, env);
@@ -269,36 +286,242 @@ export function createApp(deps: AppDeps): Hono {
   return app;
 }
 
-async function proxyAuth(c: Context, deps: AppDeps, action: AuthAction): Promise<Response> {
+type AuthAttempt = { ok: boolean; status: number; data: unknown };
+
+async function postAuthUntilWalletReady(
+  fetchImpl: typeof fetch,
+  config: ProjectScope,
+  path: string,
+  body: Record<string, string>,
+  delays: number[],
+): Promise<AuthAttempt> {
+  let attempt = await postAuth(fetchImpl, config, path, body);
+  for (const delay of delays) {
+    if (!isWalletInactiveResponse(attempt.status, attempt.data)) return attempt;
+    await delayMs(delay);
+    attempt = await postAuth(fetchImpl, config, path, body);
+  }
+  return attempt;
+}
+
+async function postAuth(
+  fetchImpl: typeof fetch,
+  config: ProjectScope,
+  path: string,
+  body: Record<string, string>,
+): Promise<AuthAttempt> {
+  const response = await vectoreeFetch(fetchImpl, config, path, { method: 'POST', body: JSON.stringify(body) });
+  return { ok: response.ok, status: response.status, data: await readJsonSafe(response) };
+}
+
+/** Only a 402 with this code or sentence. A funded wallet can still return it once. */
+function isWalletInactiveResponse(status: number, data: unknown): boolean {
+  if (status !== 402) return false;
+  const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+  const code = typeof record.code === 'string' ? record.code : typeof record.error === 'string' ? record.error : '';
+  if (code === 'BILLING_WALLET_NOT_ACTIVATED') return true;
+  return readErrorMessage(data, '').toLowerCase().includes('wallet is not activated');
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startEmailAuth(c: Context, deps: AppDeps): Promise<Response> {
   const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const record = await readRecord(c);
+  const email = typeof record.email === 'string' ? record.email.trim() : '';
+  if (!email) throw new ConfigError('email is required');
+  const password = randomBytes(24).toString('base64url');
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const delays = deps.walletRetryDelaysMs ?? WALLET_RETRY_DELAYS_MS;
+  const registered = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.register}?client_type=server`, { email, password }, delays);
+  const registeredData = registered.data;
+  if (isEmailTaken(registered.status, registeredData)) {
+    const resent = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, { email }, delays);
+    if (isWalletInactiveResponse(resent.status, resent.data)) return walletInactive(c, resent.data);
+    if (!resent.ok) {
+      return c.json({ message: readErrorMessage(resent.data, 'Could not resend the code') }, statusOf(resent.status));
+    }
+    noteCodeSent(email);
+    return c.json({ next: 'code' });
+  }
+  if (isWalletInactiveResponse(registered.status, registeredData)) return walletInactive(c, registeredData);
+  rememberBridgePassword(email, password);
+  return finishEmailAuth(c, config, email, registered.status, registeredData);
+}
+
+function walletInactive(c: Context, data: unknown): Response {
+  return c.json(
+    {
+      code: 'BILLING_WALLET_NOT_ACTIVATED',
+      message: readErrorMessage(data, 'Organization wallet is not activated'),
+    },
+    402,
+  );
+}
+
+function finishEmailAuth(c: Context, config: ProjectScope, email: string, status: number, data: unknown): Response {
+  const clientBody = toClientAuthBody(status, data);
+  const awaitingCode = 'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  if (awaitingCode) {
+    noteCodeSent(email);
+    return c.json({ next: 'code' });
+  }
+  const tokens = readSessionTokens(data);
+  const user = readPublicUser(data);
+  if (clientBody.httpStatus === 200 && tokens && user) {
+    openSession(c, config, email, user, tokens);
+    return c.json({ next: 'signed-in', user });
+  }
+  bridgePasswords.delete(emailKey(email));
+  return c.json(clientBody.body, statusOf(clientBody.httpStatus));
+}
+
+async function setAccountPassword(c: Context, deps: AppDeps): Promise<Response> {
+  const session = readSession(c);
+  if (!session) throw new ConfigError('Sign in first', 401);
+  const record = await readRecord(c);
+  const password = typeof record.password === 'string' ? record.password : '';
+  const confirmPassword = typeof record.confirmPassword === 'string' ? record.confirmPassword : '';
+  const code = typeof record.code === 'string' ? record.code.trim() : '';
+  if (password.length < 8) throw new ConfigError('Password must be at least 8 characters');
+  if (password !== confirmPassword) throw new ConfigError('Passwords do not match');
+  const email = session.user.email.trim();
+  if (!email) throw new ConfigError('Sign in first', 401);
+  const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  if (!/^\d{6}$/.test(code)) {
+    const sent = await vectoreeFetch(fetchImpl, config, '/api/auth/email/send-reset-password?client_type=server', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    const sentData = await readJsonSafe(sent);
+    if (!sent.ok) {
+      return c.json({ message: upstreamMessage(sentData, 'Could not email a reset code') }, statusOf(sent.status));
+    }
+    return c.json({ next: 'code' });
+  }
+  const exchanged = await vectoreeFetch(fetchImpl, config, '/api/auth/email/exchange-reset-password-token?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ email, code }),
+  });
+  const exchangedData = await readJsonSafe(exchanged);
+  if (!exchanged.ok) {
+    return c.json({ message: upstreamMessage(exchangedData, 'Could not verify the reset code') }, statusOf(exchanged.status));
+  }
+  const token = readResetToken(exchangedData);
+  if (!token) throw new ConfigError('Could not save password', 502);
+  const reset = await vectoreeFetch(fetchImpl, config, '/api/auth/email/reset-password?client_type=server', {
+    method: 'POST',
+    body: JSON.stringify({ newPassword: password, otp: token }),
+  });
+  const resetData = await readJsonSafe(reset);
+  if (!reset.ok) {
+    return c.json({ message: upstreamMessage(resetData, 'Could not save password') }, statusOf(reset.status));
+  }
+  const next = { ...session };
+  delete next.bridgePassword;
+  updateSession(c, next);
+  return c.json({ ok: true });
+}
+
+function readResetToken(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const token = (data as { token?: unknown }).token;
+  return typeof token === 'string' ? token : '';
+}
+
+function upstreamMessage(data: unknown, fallback: string): string {
+  const message = readErrorMessage(data, fallback);
+  if (message.includes('<') || message.startsWith('Cannot ')) return fallback;
+  return message;
+}
+
+async function proxyAuth(c: Context, deps: AppDeps, action: Exclude<AuthAction, 'register'>): Promise<Response> {
+  const config = requireLinked(c, deps.root, deps.env ?? process.env);
+  const payload = sanitizeAuthBody(action, await readJson(c));
+  if (action === 'resend' && codeCoolingDown(payload.email)) {
+    return c.json({ message: 'Wait before requesting another code' }, 429);
+  }
   const upstream = await vectoreeFetch(deps.fetchImpl ?? fetch, config, `${AUTH_PATHS[action]}?client_type=server`, {
     method: 'POST',
-    body: JSON.stringify(sanitizeAuthBody(action, await readJson(c))),
+    body: JSON.stringify(payload),
   });
   const data = await readJsonSafe(upstream);
   if (action === 'resend') {
     if (!upstream.ok) {
       return c.json({ message: readErrorMessage(data, 'Could not resend the code') }, statusOf(upstream.status));
     }
+    noteCodeSent(payload.email);
     return c.json({ ok: true });
   }
   const clientBody = toClientAuthBody(upstream.status, data);
   const tokens = readSessionTokens(data);
   const user = readPublicUser(data);
-  const awaitingCode =
-    'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  const awaitingCode = 'requireEmailVerification' in clientBody.body && clientBody.body.requireEmailVerification === true;
+  if (awaitingCode && action === 'login') noteCodeSent(payload.email);
   if (clientBody.httpStatus === 200 && tokens && user && !awaitingCode) {
-    createSession(c, {
-      user,
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      ...(config.previewId ? { previewId: config.previewId } : {}),
-    });
+    openSession(c, config, payload.email, user, tokens);
   }
   return c.json(clientBody.body, statusOf(clientBody.httpStatus));
 }
 
-function sanitizeAuthBody(action: AuthAction, body: unknown): Record<string, string> {
+function noteCodeSent(email: string, now = Date.now()): void {
+  lastCodeSentAt.set(emailKey(email), now);
+}
+
+function emailKey(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function rememberBridgePassword(email: string, password: string): void {
+  bridgePasswords.set(emailKey(email), password);
+}
+
+function takeBridgePassword(email: string): string | undefined {
+  const key = emailKey(email);
+  const password = bridgePasswords.get(key);
+  if (password) bridgePasswords.delete(key);
+  return password;
+}
+
+function openSession(
+  c: Context,
+  config: ProjectScope,
+  email: string,
+  user: PublicUser,
+  tokens: { accessToken: string; refreshToken?: string },
+): void {
+  const bridgePassword = takeBridgePassword(email);
+  createSession(c, {
+    user,
+    accessToken: tokens.accessToken,
+    ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+    ...(config.previewId ? { previewId: config.previewId } : {}),
+    ...(bridgePassword ? { bridgePassword } : {}),
+  });
+}
+
+function codeCoolingDown(email: string, now = Date.now()): boolean {
+  const sentAt = lastCodeSentAt.get(emailKey(email));
+  return sentAt !== undefined && now - sentAt < CODE_WAIT_MS;
+}
+
+function isEmailTaken(status: number, data: unknown): boolean {
+  if (status !== 409 || !data || typeof data !== 'object') return false;
+  const record = data as Record<string, unknown>;
+  if (record.error === 'AUTH_EMAIL_EXISTS' || record.code === 'AUTH_EMAIL_EXISTS') return true;
+  const nested = record.error;
+  return Boolean(nested && typeof nested === 'object' && (nested as { code?: unknown }).code === 'AUTH_EMAIL_EXISTS');
+}
+
+async function readRecord(c: Context): Promise<Record<string, unknown>> {
+  const body = await readJson(c);
+  return body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+}
+
+function sanitizeAuthBody(action: Exclude<AuthAction, 'register'>, body: unknown): Record<string, string> {
   const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
   const email = typeof record.email === 'string' ? record.email.trim() : '';
   if (!email) throw new ConfigError('email is required');
@@ -310,11 +533,7 @@ function sanitizeAuthBody(action: AuthAction, body: unknown): Record<string, str
   if (action === 'resend') return { email };
   const password = typeof record.password === 'string' ? record.password : '';
   if (!password) throw new ConfigError('password is required');
-  const payload: Record<string, string> = { email, password };
-  if (action === 'register' && typeof record.name === 'string' && record.name.trim()) {
-    payload.name = record.name.trim();
-  }
-  return payload;
+  return { email, password };
 }
 
 function parseChatBody(body: unknown): {
@@ -378,12 +597,13 @@ async function vectoreeFetch(
   config: AppConfig & { apiKey: string },
   path: string,
   init: RequestInit,
+  bearer = config.apiKey,
 ) {
   try {
     return await fetchImpl(`${config.apiUrl}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${bearer}`,
         Accept: 'application/json',
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
       },
