@@ -210,7 +210,14 @@ export function AuthScreen({
           ) : null}
           {error ? (
             <div className="error" role="alert">
-              {error}
+              <p>{error}</p>
+              {walletNotActivated(error) ? (
+                <p>
+                  {t('walletActivateBefore')}
+                  <a href={billingHref(returnHref)}>{t('walletActivateLink')}</a>
+                  {t('walletActivateAfter')}
+                </p>
+              ) : null}
             </div>
           ) : null}
           {notice && step !== 'code' ? <p className="auth-notice">{notice}</p> : null}
@@ -258,6 +265,15 @@ function ArrowLeft() {
       <path d="M19 12H6M11 6l-6 6 6 6" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="square" />
     </svg>
   );
+}
+
+function billingHref(dashboardHref: string): string {
+  return `${dashboardHref.replace(/\/$/, '')}/organization/billing`;
+}
+
+function walletNotActivated(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes('wallet is not activated') || text.includes('billing_wallet_not_activated');
 }
 
 function isSignedIn(result: EmailStartResult): result is { next: 'signed-in'; user: PublicUser } {

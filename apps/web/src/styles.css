@@ -1467,6 +1467,21 @@ a {
   font-size: 11px;
 }
 
+.error p {
+  margin: 0;
+}
+
+.error p + p {
+  margin-top: 6px;
+}
+
+.error a {
+  color: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .tabs {
   display: flex;
   gap: 8px;
