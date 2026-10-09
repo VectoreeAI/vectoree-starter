@@ -13,6 +13,11 @@ export type SessionRecord = {
   refreshToken?: string;
   /** Cloud only: the preview this login was made under. */
   previewId?: string;
+  /**
+   * Server-only password created at registration. The visitor never sees it.
+   * It is sent as currentPassword the first time they choose their own password.
+   */
+  bridgePassword?: string;
 };
 
 const sessions = new Map<string, SessionRecord>();
@@ -26,6 +31,12 @@ export function createSession(c: Context, record: SessionRecord): void {
     path: '/',
     secure: process.env.NODE_ENV === 'production',
   });
+}
+
+export function updateSession(c: Context, record: SessionRecord): void {
+  const id = getCookie(c, COOKIE);
+  if (!id || !sessions.has(id)) return;
+  sessions.set(id, record);
 }
 
 export function readSession(c: Context): SessionRecord | null {

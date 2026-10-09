@@ -30,8 +30,6 @@ export function ChatScreen({
   models,
   model,
   imageModel,
-  onDatabase,
-  onStorage,
   onTitled,
   onSaved,
 }: {
@@ -40,13 +38,10 @@ export function ChatScreen({
   models: ListedModel[];
   model: string;
   imageModel: string;
-  onDatabase?: () => void;
-  onStorage?: () => void;
   onTitled: (id: string, title: string) => void;
   onSaved: (id: string) => void;
 }) {
   const { t } = useI18n();
-  const [imageTool, setImageTool] = useState(true);
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [image, setImage] = useState<ChatImage | null>(null);
@@ -169,7 +164,7 @@ export function ChatScreen({
       await streamChat(
         {
           model,
-          imageTool: imageTool && Boolean(imageModel),
+          imageTool: Boolean(imageModel),
           ...(imageModel ? { imageModel } : {}),
           messages: history.map((item) => ({
             role: item.role,
@@ -189,8 +184,6 @@ export function ChatScreen({
               pending: true,
             }));
           },
-          onDatabase: () => onDatabase?.(),
-          onStorage: () => onStorage?.(),
           onImageStatus: (payload) => {
             turn = patchTurn(turn, id, assistantId, (item) => {
               if (payload.status === 'error') return { ...item, generatingCount: undefined, pending: true };
@@ -222,29 +215,28 @@ export function ChatScreen({
 
   return (
       <div className="chat-shell">
-        <div className="row" style={{ marginBottom: 12 }}>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={imageTool && Boolean(imageModel)}
-              disabled={!imageModel || streaming}
-              onChange={(event) => setImageTool(event.target.checked)}
-            />
-            {t('imageTool')}
-          </label>
-        </div>
         <div className="messages" ref={scroller}>
-          <div className="chat-column">
           {messages.length === 0 ? (
-            <div className="empty panel">
-              <p className="eyebrow">{t('chat')}</p>
-              <h2 className="display" style={{ fontSize: 32 }}>
-                {t('askModel')}
-              </h2>
-              <p className="note">{t('chatNote')}</p>
-              {!imageModel ? <p className="note">{t('noImageModel')}</p> : null}
+            <div className="chat-empty">
+              <h2 className="panel-title">{t('chatStartTitle')}</h2>
+              <p className="note">{t('chatStartNote')}</p>
+              <p className="chat-models">
+                <span className="eyebrow">{t('chatModel')}</span>
+                <span className="mono">{model}</span>
+              </p>
+              {imageModel ? (
+                <p className="chat-models">
+                  <span className="eyebrow">{t('imageModel')}</span>
+                  <span className="mono">{imageModel}</span>
+                </p>
+              ) : (
+                <p className="note">{t('noImageModel')}</p>
+              )}
+              <p className="note">{t('chatStartSettings')}</p>
+              <p className="chat-credit">{t('chatStartEyebrow')}</p>
             </div>
-          ) : null}
+          ) : (
+          <div className="chat-column">
           {messages.map((item) => (
             <article key={item.id} className={item.role === 'user' ? 'bubble user' : 'bubble'}>
               <div className="who">{item.role === 'user' ? t('you') : model}</div>
@@ -268,6 +260,7 @@ export function ChatScreen({
             </article>
           ))}
           </div>
+          )}
         </div>
         <form
           className="composer"
@@ -297,26 +290,38 @@ export function ChatScreen({
               }
             }}
           />
-          <div className="row">
-            <input
-              ref={fileRef}
-              hidden
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              onChange={(event) => {
-                void onPickFile(event.target.files?.[0]);
-                event.target.value = '';
-              }}
-            />
-            <button className="btn-ghost" type="button" onClick={() => fileRef.current?.click()}>
-              {t('attach')}
-            </button>
+          <div className="composer-bar">
+            <div className="composer-tools">
+              <input
+                ref={fileRef}
+                hidden
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                onChange={(event) => {
+                  void onPickFile(event.target.files?.[0]);
+                  event.target.value = '';
+                }}
+              />
+              <button className="icon-tool" type="button" aria-label={t('attach')} disabled={streaming} onClick={() => fileRef.current?.click()}>
+                <ImageIcon />
+              </button>
+            </div>
             <button className="btn" type="submit" disabled={streaming || (!draft.trim() && !image)}>
               {streaming ? t('streaming') : t('send')}
             </button>
           </div>
         </form>
       </div>
+  );
+}
+
+function ImageIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="1.5" y="2.5" width="13" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <rect x="4" y="5" width="2" height="2" fill="currentColor" />
+      <path d="M2 12.5 L6 8.5 L8.5 10.5 L11 8 L14 12" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
   );
 }
 

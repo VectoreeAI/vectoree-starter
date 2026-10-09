@@ -1,14 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <title>Vectoree Starter favicon</title>
-  <desc>Acid Brutalism Vee face with a large bottom-right Starter badge: blocky acid S on an ink square</desc>
-  <rect x="6" y="10" width="48" height="44" fill="#101010"/>
-  <rect x="10" y="14" width="44" height="40" fill="#D8FF00" stroke="#101010" stroke-width="5"/>
-  <rect x="21" y="26" width="8" height="13" fill="#101010"/>
-  <rect x="37" y="26" width="8" height="13" fill="#101010"/>
-  <rect x="30" y="32" width="32" height="30" fill="#101010"/>
-  <rect x="35" y="36" width="22" height="6" fill="#D8FF00"/>
-  <rect x="35" y="36" width="6" height="14" fill="#D8FF00"/>
-  <rect x="35" y="46" width="22" height="6" fill="#D8FF00"/>
-  <rect x="51" y="46" width="6" height="12" fill="#D8FF00"/>
-  <rect x="35" y="54" width="22" height="6" fill="#D8FF00"/>
+  <title>Vectoree Starter</title>
+  <desc>Same Vee face as the Vectoree favicon, with a blank template sheet behind it.</desc>
+  <rect x="3" y="5" width="44" height="40" fill="#F1F1E8" stroke="#101010" stroke-width="4"/>
+  <rect x="12" y="14" width="48" height="44" fill="#101010"/>
+  <rect x="16" y="18" width="44" height="40" fill="#D8FF00" stroke="#101010" stroke-width="5"/>
+  <rect x="27" y="30" width="8" height="13" fill="#101010"/>
+  <rect x="43" y="30" width="8" height="13" fill="#101010"/>
 </svg>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">
+  <title>Vee — Vectoree mascot (primary logo)</title>
+  <desc>Acid-yellow square robot head with ink outline, antenna and hard offset shadow</desc>
+  <!-- hard shadow -->
+  <rect x="72" y="82" width="120" height="108" fill="#101010"/>
+  <!-- ears / signal receivers -->
+  <rect x="40" y="112" width="20" height="40" fill="#101010"/>
+  <rect x="180" y="112" width="20" height="40" fill="#101010"/>
+  <!-- antenna -->
+  <rect x="114" y="40" width="12" height="32" fill="#101010"/>
+  <rect x="106" y="16" width="28" height="24" fill="#D8FF00" stroke="#101010" stroke-width="6"/>
+  <!-- head -->
+  <rect x="60" y="70" width="120" height="108" fill="#D8FF00" stroke="#101010" stroke-width="8"/>
+  <!-- eyes -->
+  <rect x="88" y="106" width="20" height="30" fill="#101010"/>
+  <rect x="132" y="106" width="20" height="30" fill="#101010"/>
+  <!-- mouth -->
+  <rect x="108" y="152" width="24" height="8" fill="#101010"/>
+</svg>
