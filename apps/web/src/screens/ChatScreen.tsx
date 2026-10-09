@@ -99,7 +99,7 @@ export function ChatScreen({
   const selected = models.find((item) => item.id === model);
   const visionHint = useMemo(() => {
     if (!image || selected?.vision) return '';
-    const vision = models.find((item) => item.vision);
+    const vision = models.find((item) => item.chat && item.vision);
     return vision ? t('visionWith', { model: vision.id }) : t('visionWithout');
   }, [image, models, selected, t]);
 

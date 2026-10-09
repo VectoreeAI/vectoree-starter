@@ -26,6 +26,7 @@ export function SettingsDialog({
   const [reveal, setReveal] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const chatModels = models.filter((item) => item.chat);
   const imageModels = models.filter((item) => item.imageOutput);
 
   useEffect(() => {
@@ -127,8 +128,8 @@ export function SettingsDialog({
             value={model}
             onChange={(event) => onModel(event.target.value)}
           >
-            {models.length === 0 ? <option value={model}>{model}</option> : null}
-            {models.map((item) => (
+            {chatModels.length === 0 ? <option value={model}>{model}</option> : null}
+            {chatModels.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.vision ? `${item.id} · ${t('visionTag')}` : item.id}
               </option>

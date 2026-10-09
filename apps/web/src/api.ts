@@ -27,6 +27,7 @@ export type PublicUser = {
 export type ListedModel = {
   id: string;
   name: string;
+  chat: boolean;
   vision: boolean;
   imageOutput?: boolean;
 };
