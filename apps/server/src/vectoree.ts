@@ -3,6 +3,8 @@ export const FALLBACK_MODEL = 'vectoree/auto';
 export type ListedModel = {
   id: string;
   name: string;
+  /** Text-only output: a language model, including vision language models. */
+  chat: boolean;
   vision: boolean;
   imageOutput: boolean;
 };
@@ -36,10 +38,12 @@ export function parseModelList(payload: unknown): ListedModel[] {
         : typeof raw.displayName === 'string' && raw.displayName.trim()
           ? raw.displayName.trim()
           : raw.id;
+    const chat = isLanguageModel(raw);
     models.push({
       id: raw.id,
       name,
-      vision: isVisionModel(raw),
+      chat,
+      vision: chat && isVisionModel(raw),
       imageOutput: isImageOutputModel(raw),
     });
   }
@@ -47,7 +51,8 @@ export function parseModelList(payload: unknown): ListedModel[] {
 }
 
 export function pickDefaultModel(models: ListedModel[]): string {
-  return models.find((model) => model.vision)?.id ?? models[0]?.id ?? FALLBACK_MODEL;
+  const chat = models.filter((model) => model.chat);
+  return chat.find((model) => model.vision)?.id ?? chat[0]?.id ?? FALLBACK_MODEL;
 }
 
 export function pickImageModel(models: ListedModel[]): string | null {
@@ -55,6 +60,14 @@ export function pickImageModel(models: ListedModel[]): string | null {
   const grok = images.filter((model) => /grok-imagine/i.test(model.id));
   if (grok.length > 0) return grok.find((model) => /quality/i.test(model.id))?.id ?? grok[0].id;
   return images[0]?.id ?? null;
+}
+
+/** Chat models are language models: output tag is text, input is not embedding or rerank. */
+export function isLanguageModel(model: RawModel): boolean {
+  const input = modalityList(model.inputModality, model.architecture?.input_modalities);
+  const output = modalityList(model.outputModality, model.architecture?.output_modalities);
+  if (!output.includes('text') || output.some((item) => item !== 'text')) return false;
+  return !input.some((item) => item === 'embeddings' || item === 'embedding' || item === 'rerank');
 }
 
 export function isVisionModel(model: RawModel): boolean {
@@ -74,7 +87,10 @@ export function isImageOutputModel(model: RawModel): boolean {
 
 function modalityList(primary: unknown, fallback: unknown): string[] {
   const source = Array.isArray(primary) ? primary : Array.isArray(fallback) ? fallback : [];
-  return source.filter((item): item is string => typeof item === 'string');
+  return source
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
