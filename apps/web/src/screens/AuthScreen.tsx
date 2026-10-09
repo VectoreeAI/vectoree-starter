@@ -210,14 +210,15 @@ export function AuthScreen({
           ) : null}
           {error ? (
             <div className="error" role="alert">
-              <p>{error}</p>
               {walletNotActivated(error) ? (
                 <p>
                   {t('walletActivateBefore')}
                   <a href={billingHref(returnHref)}>{t('walletActivateLink')}</a>
                   {t('walletActivateAfter')}
                 </p>
-              ) : null}
+              ) : (
+                <p>{error}</p>
+              )}
             </div>
           ) : null}
           {notice && step !== 'code' ? <p className="auth-notice">{notice}</p> : null}
