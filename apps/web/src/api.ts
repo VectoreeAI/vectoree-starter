@@ -36,12 +36,18 @@ export type ChatImage = {
   mediaType: string;
   data: string;
   previewUrl: string;
+  url?: string;
 };
 
 function withBase(path: string): string {
   if (!path.startsWith('/')) return path;
   const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   return `${base}${path}`;
+}
+
+/** Turns a BFF path such as a saved chat image into a URL the browser can load. */
+export function assetUrl(url: string): string {
+  return withBase(url);
 }
 
 export const PREVIEW_REQUIRED = 'preview_required';
@@ -176,7 +182,7 @@ export type ConversationMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  image?: { mediaType: string; data?: string };
+  image?: { mediaType?: string; data?: string; url?: string };
   generated?: { url: string }[];
 };
 
@@ -194,7 +200,10 @@ export function getConversation(id: string): Promise<Conversation> {
   return request(`/api/conversations/${encodeURIComponent(id)}`);
 }
 
-export function saveConversation(id: string, messages: ConversationMessage[]): Promise<ConversationMeta> {
+export function saveConversation(
+  id: string,
+  messages: ConversationMessage[],
+): Promise<ConversationMeta & { messages?: ConversationMessage[] }> {
   return request(`/api/conversations/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify({ messages }),

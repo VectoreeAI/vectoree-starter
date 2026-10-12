@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { clearAuthCooldowns, createApp } from './app.js';
+import { clearConversationDrafts } from './conversations.js';
 import { normalizeSchema, parseCreateTable } from './database.js';
 import { loadEnvFiles, normalizeApiUrl, publicSetupStatus, writeLinkedConfig, writeProjectConfig, deploymentMode } from './config.js';
 import { createImageToolResponse, normalizeGeneratedImages } from './image-tool.js';
@@ -19,43 +21,59 @@ function tempRoot(): string {
   return dir;
 }
 
-type ChatRow = {
-  id: string;
-  user_id: string;
-  title: string;
-  titled_by_model: boolean;
-  messages: unknown;
-  created_at: string;
-  updated_at: string;
+type ChatRow = Record<string, unknown> & { id: string; created_at: string; updated_at: string };
+
+type ChatStore = {
+  tables: Set<string>;
+  rows: ChatRow[];
+  buckets: Set<string>;
+  objects: Map<string, { bytes: ArrayBuffer; type: string }>;
+  uploads: number;
+  coldReads: number;
 };
 
-function memoryChats(fallback?: typeof fetch, tap?: (input: RequestInfo | URL, init?: RequestInit) => void): typeof fetch {
-  const buckets = new Map<string, { tables: Set<string>; rows: ChatRow[] }>();
-  let tick = Date.parse('2026-01-01T00:00:00.000Z');
+const CHAT_IMAGE_OBJECTS = '/api/storage/buckets/starter_chat_images/objects/';
+
+function memoryChats(
+  fallback?: typeof fetch,
+  tap?: (input: RequestInfo | URL, init?: RequestInit) => void,
+): typeof fetch & { store: (apiKey: string) => ChatStore } {
+  const stores = new Map<string, ChatStore>();
+  let tick = Date.now();
   const now = () => new Date((tick += 1000)).toISOString();
-  const bucket = (auth: string) => {
-    let found = buckets.get(auth);
+  const store = (auth: string) => {
+    let found = stores.get(auth);
     if (!found) {
-      found = { tables: new Set(), rows: [] };
-      buckets.set(auth, found);
+      found = { tables: new Set(), rows: [], buckets: new Set(), objects: new Map(), uploads: 0, coldReads: 0 };
+      stores.set(auth, found);
     }
     return found;
   };
   const matches = (row: ChatRow, url: URL) => {
     for (const [key, value] of url.searchParams) {
       if (key === 'limit' || key === 'offset' || key === 'order' || key === 'select') continue;
+      if (value.startsWith('in.(')) {
+        if (!value.slice(4, -1).split(',').includes(String(row[key]))) return false;
+        continue;
+      }
       const expected = value.startsWith('eq.') ? value.slice(3) : value;
-      if (String(row[key as keyof ChatRow]) !== expected) return false;
+      if (String(row[key]) !== expected) return false;
     }
     return true;
   };
-  return (async (input, init) => {
+  const pick = (list: ChatRow[], url: URL) => {
+    const select = url.searchParams.get('select');
+    if (!select) return list;
+    const fields = select.split(',');
+    return list.map((row) => Object.fromEntries(fields.map((field) => [field, row[field]])));
+  };
+  const handler = (async (input: RequestInfo | URL, init?: RequestInit) => {
     tap?.(input, init);
     const url = new URL(String(input));
     const method = (init?.method ?? 'GET').toUpperCase();
     const auth = new Headers(init?.headers).get('authorization') ?? '';
     if (url.pathname === '/api/database/tables' && method === 'GET') {
-      return Response.json([...bucket(auth).tables]);
+      return Response.json([...store(auth).tables]);
     }
     if (url.pathname === '/api/database/tables' && method === 'POST') {
       const body = JSON.parse(String(init?.body)) as {
@@ -63,69 +81,114 @@ function memoryChats(fallback?: typeof fetch, tap?: (input: RequestInfo | URL, i
         rlsEnabled?: boolean;
         columns?: { columnName: string; type: string; isNullable: boolean }[];
       };
-      assert.equal(body.tableName, 'starter_chats');
+      assert.equal(body.tableName, 'starter_chat_messages');
       assert.equal(body.rlsEnabled, false);
       assert.deepEqual(
         (body.columns ?? []).map((column) => [column.columnName, column.type, column.isNullable]),
         [
+          ['chat_id', 'uuid', false],
           ['user_id', 'string', false],
-          ['title', 'string', false],
+          ['chat_title', 'string', false],
           ['titled_by_model', 'boolean', false],
-          ['messages', 'json', false],
+          ['seq', 'integer', false],
+          ['role', 'string', false],
+          ['content', 'string', false],
+          ['image_urls', 'string', true],
         ],
       );
-      const store = bucket(auth);
-      if (store.tables.has('starter_chats')) {
-        return Response.json({ message: 'table starter_chats already exists' }, { status: 400 });
+      const found = store(auth);
+      if (found.tables.has('starter_chat_messages')) {
+        return Response.json({ message: 'table starter_chat_messages already exists' }, { status: 400 });
       }
-      store.tables.add('starter_chats');
-      return Response.json({ tableName: 'starter_chats' }, { status: 201 });
+      found.tables.add('starter_chat_messages');
+      found.coldReads = 1;
+      return Response.json({ tableName: 'starter_chat_messages' }, { status: 201 });
     }
-    if (url.pathname === '/api/database/records/starter_chats') {
-      const store = bucket(auth);
+    if (url.pathname === '/api/database/records/starter_chat_messages') {
+      const found = store(auth);
+      if (found.coldReads > 0) {
+        found.coldReads -= 1;
+        return Response.json({}, { status: 404 });
+      }
       if (method === 'GET') {
-        let matched = store.rows.filter((row) => matches(row, url));
-        if (url.searchParams.get('order') === 'updated_at.desc') {
-          matched = [...matched].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
-        }
+        let matched = found.rows.filter((row) => matches(row, url));
+        const order = url.searchParams.get('order');
+        if (order === 'updated_at.desc') matched = [...matched].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+        if (order === 'seq.asc') matched = [...matched].sort((a, b) => Number(a.seq) - Number(b.seq));
         const limit = Number(url.searchParams.get('limit') ?? matched.length);
-        matched = matched.slice(0, limit);
-        const select = url.searchParams.get('select');
-        if (!select) return Response.json(matched);
-        const fields = select.split(',');
-        return Response.json(matched.map((row) => Object.fromEntries(fields.map((field) => [field, row[field as keyof ChatRow]]))));
+        return Response.json(pick(matched.slice(0, limit), url));
       }
       if (method === 'POST') {
         const incoming = JSON.parse(String(init?.body)) as ChatRow[];
+        if (incoming.some((row) => found.rows.some((existing) => existing.id === row.id))) {
+          return Response.json({ message: 'duplicate key value violates unique constraint' }, { status: 409 });
+        }
         const created = incoming.map((row) => {
           const stamp = now();
-          return { ...row, titled_by_model: Boolean(row.titled_by_model), messages: row.messages ?? [], created_at: stamp, updated_at: stamp };
+          return { ...row, created_at: stamp, updated_at: stamp };
         });
-        store.rows.push(...created);
+        found.rows.push(...created);
         return Response.json(created, { status: 201 });
       }
       if (method === 'PATCH') {
         const patch = JSON.parse(String(init?.body)) as Partial<ChatRow>;
         const stamp = now();
-        const updated = store.rows.filter((row) => matches(row, url));
+        const updated = found.rows.filter((row) => matches(row, url));
         for (const row of updated) Object.assign(row, patch, { updated_at: stamp });
-        return Response.json(updated);
+        return Response.json(pick(updated, url));
       }
       if (method === 'DELETE') {
-        const removed = store.rows.filter((row) => matches(row, url));
-        store.rows = store.rows.filter((row) => !matches(row, url));
-        return Response.json(removed);
+        const removed = found.rows.filter((row) => matches(row, url));
+        found.rows = found.rows.filter((row) => !matches(row, url));
+        return Response.json(pick(removed, url));
+      }
+    }
+    if (url.pathname === '/api/storage/buckets' && method === 'POST') {
+      const body = JSON.parse(String(init?.body)) as { bucketName?: string; isPublic?: boolean };
+      if (body.bucketName === 'starter_chat_images') {
+        assert.equal(body.isPublic, false);
+        const found = store(auth);
+        if (found.buckets.has(body.bucketName)) {
+          return Response.json({ message: 'Bucket already exists' }, { status: 409 });
+        }
+        found.buckets.add(body.bucketName);
+        return Response.json({ bucketName: body.bucketName }, { status: 201 });
+      }
+    }
+    if (url.pathname.startsWith(CHAT_IMAGE_OBJECTS)) {
+      const found = store(auth);
+      const key = decodeURIComponent(url.pathname.slice(CHAT_IMAGE_OBJECTS.length));
+      if (method === 'PUT') {
+        assert.equal(found.buckets.has('starter_chat_images'), true);
+        const file = (init?.body as FormData).get('file') as Blob;
+        found.objects.set(key, { bytes: await file.arrayBuffer(), type: file.type });
+        found.uploads += 1;
+        return Response.json(
+          { key, url: `https://vectoree.ai${CHAT_IMAGE_OBJECTS}${encodeURIComponent(key)}?v=${found.uploads}` },
+          { status: 201 },
+        );
+      }
+      const object = found.objects.get(key);
+      if (method === 'GET') {
+        if (!object) return Response.json({ message: 'Object not found' }, { status: 404 });
+        return new Response(object.bytes, { headers: { 'Content-Type': object.type } });
+      }
+      if (method === 'DELETE') {
+        found.objects.delete(key);
+        return Response.json({ message: 'Object deleted successfully' });
       }
     }
     if (fallback) return fallback(input, init);
     return new Response('not found', { status: 404 });
   }) as typeof fetch;
+  return Object.assign(handler, { store: (apiKey: string) => store(`Bearer ${apiKey}`) });
 }
 
 afterEach(() => {
   clearAuthCooldowns();
   clearSessions();
   clearPreviews();
+  clearConversationDrafts();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -637,9 +700,10 @@ describe('conversations', () => {
       projectId: 'proj_123',
       apiKey: secret,
     });
-    const app = createApp({ root, env: {}, fetchImpl: memoryChats(fetchImpl) });
+    const chats = memoryChats(fetchImpl);
+    const app = createApp({ root, env: {}, fetchImpl: chats });
     const sid = seedSession({ user: { id: 'u1', email: 'a@example.com' }, accessToken: 'app-jwt' });
-    return { app, sid, root };
+    return { app, sid, root, store: () => chats.store(secret) };
   }
 
   function cookie(sid: string): Record<string, string> {
@@ -662,8 +726,9 @@ describe('conversations', () => {
   });
 
   it('creates, lists, updates, and deletes a conversation', async () => {
-    const { app, sid } = linkedApp();
+    const { app, sid, store } = linkedApp();
     const headers = cookie(sid);
+    const [m1, m2, m3] = [randomUUID(), randomUUID(), randomUUID()];
     const created = (await (await app.request('/api/conversations', { method: 'POST', headers, body: '{}' })).json()) as {
       id: string;
       title: string;
@@ -682,16 +747,41 @@ describe('conversations', () => {
       headers,
       body: JSON.stringify({
         messages: [
-          { id: 'm1', role: 'user', content: 'hello' },
-          { id: 'm2', role: 'assistant', content: 'hi there' },
+          { id: m1, role: 'user', content: 'hello' },
+          { id: m2, role: 'assistant', content: 'hi there' },
         ],
       }),
     });
     assert.equal(put.status, 200);
+    assert.deepEqual(
+      store().rows.map((row) => [row.chat_id, row.user_id, row.chat_title, row.seq, row.role, row.content, row.image_urls]),
+      [
+        [created.id, 'u1', 'New chat', 0, 'user', 'hello', null],
+        [created.id, 'u1', 'New chat', 1, 'assistant', 'hi there', null],
+      ],
+    );
     const loaded = (await (await app.request(`/api/conversations/${created.id}`, { headers })).json()) as {
       messages: { content: string }[];
     };
     assert.equal(loaded.messages[1]?.content, 'hi there');
+    const edited = await app.request(`/api/conversations/${created.id}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        messages: [
+          { id: m1, role: 'user', content: 'hello' },
+          { id: m3, role: 'assistant', content: 'second answer' },
+        ],
+      }),
+    });
+    assert.equal(edited.status, 200);
+    assert.deepEqual(
+      store().rows.map((row) => [row.id, row.seq, row.content]),
+      [
+        [m1, 0, 'hello'],
+        [m3, 1, 'second answer'],
+      ],
+    );
     const listed = (await (await app.request('/api/conversations', { headers })).json()) as {
       conversations: { id: string }[];
     };
@@ -705,6 +795,7 @@ describe('conversations', () => {
     ).json()) as { title: string; titledByModel?: boolean };
     assert.equal(renamed.title, 'Manual name');
     assert.equal(renamed.titledByModel, true);
+    assert.deepEqual(new Set(store().rows.map((row) => row.chat_title)), new Set(['Manual name']));
     const removed = await app.request(`/api/conversations/${forced.id}`, { method: 'DELETE', headers });
     assert.equal(removed.status, 200);
     const after = (await (await app.request('/api/conversations', { headers })).json()) as { conversations: { id: string }[] };
@@ -712,11 +803,14 @@ describe('conversations', () => {
     assert.equal(JSON.stringify(after).includes(secret), false);
   });
 
-  it('keeps a long generated data URL intact', async () => {
-    const { app, sid } = linkedApp();
+  it('uploads chat images to storage and keeps only their addresses in the table', async () => {
+    const { app, sid, store } = linkedApp();
     const headers = cookie(sid);
-    const dataUrl = `data:image/png;base64,${'A'.repeat(50_000)}`;
+    const attached = Buffer.from('user-picture').toString('base64');
+    const drawn = Buffer.from('drawn-picture');
+    const dataUrl = `data:image/png;base64,${drawn.toString('base64')}`;
     const httpsUrl = 'https://cdn.example/cat.png';
+    const [m1, m2] = [randomUUID(), randomUUID()];
     const created = (await (await app.request('/api/conversations', { method: 'POST', headers, body: '{}' })).json()) as {
       id: string;
     };
@@ -725,24 +819,59 @@ describe('conversations', () => {
       headers,
       body: JSON.stringify({
         messages: [
-          {
-            id: 'm1',
-            role: 'assistant',
-            content: '',
-            generated: [{ url: dataUrl }, { url: httpsUrl }],
-          },
+          { id: m1, role: 'user', content: 'what is this', image: { mediaType: 'image/jpeg', data: attached } },
+          { id: m2, role: 'assistant', content: 'here you go', generated: [{ url: dataUrl }, { url: httpsUrl }] },
         ],
       }),
     });
     assert.equal(put.status, 200);
+    const userKey = `u1/${created.id}/${m1}-0.jpg`;
+    const drawnKey = `u1/${created.id}/${m2}-0.png`;
+    const objects = 'https://vectoree.ai/api/storage/buckets/starter_chat_images/objects/';
+    assert.deepEqual(
+      store().rows.map((row) => [row.role, row.content, row.image_urls]),
+      [
+        ['user', 'what is this', `${objects}${encodeURIComponent(userKey)}?v=1`],
+        ['assistant', 'here you go', `${objects}${encodeURIComponent(drawnKey)}?v=2\n${httpsUrl}`],
+      ],
+    );
+    assert.equal(JSON.stringify(store().rows).includes('base64'), false);
+
+    const saved = (await put.json()) as { messages: { image?: { url: string }; generated?: { url: string }[] }[] };
+    const userView = `/api/chat-images?key=${encodeURIComponent(userKey)}`;
+    const drawnView = `/api/chat-images?key=${encodeURIComponent(drawnKey)}`;
+    assert.equal(saved.messages[0]?.image?.url, userView);
+    assert.deepEqual(saved.messages[1]?.generated, [{ url: drawnView }, { url: httpsUrl }]);
+
     const loaded = (await (await app.request(`/api/conversations/${created.id}`, { headers })).json()) as {
-      messages: { generated?: { url: string }[] }[];
+      messages: { image?: { url: string }; generated?: { url: string }[] }[];
     };
-    const urls = loaded.messages[0]?.generated ?? [];
-    assert.equal(urls[0]?.url, dataUrl);
-    assert.equal(urls[0]?.url.length, dataUrl.length);
-    assert.notEqual(urls[0]?.url.length, 2000);
-    assert.equal(urls[1]?.url, httpsUrl);
+    assert.equal(loaded.messages[0]?.image?.url, userView);
+    assert.deepEqual(loaded.messages[1]?.generated, [{ url: drawnView }, { url: httpsUrl }]);
+
+    const image = await app.request(drawnView, { headers });
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await image.arrayBuffer()), drawn);
+    const stranger = seedSession({ user: { id: 'u2', email: 'b@example.com' }, accessToken: 'app-jwt-2' });
+    assert.equal((await app.request(drawnView, { headers: cookie(stranger) })).status, 404);
+
+    const again = await app.request(`/api/conversations/${created.id}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        messages: [
+          { id: m1, role: 'user', content: 'what is this', image: { url: userView } },
+          { id: m2, role: 'assistant', content: 'here you go', generated: [{ url: dataUrl }, { url: httpsUrl }] },
+        ],
+      }),
+    });
+    assert.equal(again.status, 200);
+    assert.equal(store().uploads, 2);
+
+    assert.equal((await app.request(`/api/conversations/${created.id}`, { method: 'DELETE', headers })).status, 200);
+    assert.equal(store().rows.length, 0);
+    assert.equal(store().objects.size, 0);
   });
 
   it('names a conversation from a tool-free chat completion', async () => {
@@ -765,7 +894,7 @@ describe('conversations', () => {
     await app.request(`/api/conversations/${created.id}`, {
       method: 'PUT',
       headers,
-      body: JSON.stringify({ messages: [{ id: 'm1', role: 'user', content: 'hello from the user' }] }),
+      body: JSON.stringify({ messages: [{ id: randomUUID(), role: 'user', content: 'hello from the user' }] }),
     });
     const named = await app.request(`/api/conversations/${created.id}/generate-title`, {
       method: 'POST',
@@ -1954,7 +2083,7 @@ describe('cloud preview', () => {
       await app.request(`/api/conversations/${created.id}`, {
         method: 'PUT',
         headers: json,
-        body: JSON.stringify({ messages: [{ id: 'm1', role: 'user', content: 'hello' }] }),
+        body: JSON.stringify({ messages: [{ id: randomUUID(), role: 'user', content: 'hello' }] }),
       });
       const named = await app.request(`/api/conversations/${created.id}/generate-title`, {
         method: 'POST',
@@ -2036,7 +2165,8 @@ describe('cloud preview', () => {
 
   it('keeps conversations apart per project and per user in the backend table', async () => {
     const root = tempRoot();
-    const app = createApp({ root, env: cloudEnv(), fetchImpl: memoryChats() });
+    const chats = memoryChats();
+    const app = createApp({ root, env: cloudEnv(), fetchImpl: chats });
     const cookieA = previewCookie(keyA, 'proj_a', 'same-user');
     const cookieB = previewCookie(keyB, 'proj_b', 'same-user');
     const make = async (cookie: string) =>
@@ -2052,6 +2182,14 @@ describe('cloud preview', () => {
         .conversations.map((item) => item.id);
     const a = await make(cookieA);
     const b = await make(cookieB);
+    const saved = await app.request(`/api/conversations/${a.id}`, {
+      method: 'PUT',
+      headers: { Cookie: cookieA, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [{ id: randomUUID(), role: 'user', content: 'only in project a' }] }),
+    });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(chats.store(keyA).rows.map((row) => row.content), ['only in project a']);
+    assert.equal(chats.store(keyB).rows.length, 0);
     assert.deepEqual(await list(cookieA), [a.id]);
     assert.deepEqual(await list(cookieB), [b.id]);
     assert.equal((await app.request(`/api/conversations/${a.id}`, { headers: { Cookie: cookieB } })).status, 404);

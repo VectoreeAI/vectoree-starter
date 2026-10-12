@@ -287,7 +287,7 @@ async function bytesFromArgs(
   throw new ConfigError('upload_object needs textContent, contentBase64, or sourceUrl');
 }
 
-async function putObject(
+export async function putObject(
   fetchImpl: typeof fetch,
   auth: StorageAuth,
   bucket: string,
@@ -306,7 +306,7 @@ async function putObject(
   return data;
 }
 
-function objectPath(bucket: string, key: string): string {
+export function objectPath(bucket: string, key: string): string {
   return `/api/storage/buckets/${encodeURIComponent(bucket)}/objects/${encodeURIComponent(key)}`;
 }
 
@@ -341,7 +341,7 @@ async function readOk(fetchImpl: typeof fetch, auth: StorageAuth, path: string, 
   return data;
 }
 
-async function storageFetch(fetchImpl: typeof fetch, auth: StorageAuth, path: string, init: RequestInit, json: boolean) {
+export async function storageFetch(fetchImpl: typeof fetch, auth: StorageAuth, path: string, init: RequestInit, json: boolean) {
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${auth.apiKey}`);
   if (json) headers.set('Accept', 'application/json');
