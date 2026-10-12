@@ -214,16 +214,27 @@ export async function createImageToolResponse(input: {
     streamController.close();
   };
 
+  const domainTask = intent === 'database' || intent === 'storage';
+  /** Live turns forward text as it arrives. A turn whose text-only reply may be dropped for a retry is buffered. */
+  const ask = async (choice: ToolChoice, live: boolean, timeoutMs?: number) => {
+    const turn = await completeChat(input, messages, choice, imageEnabled, timeoutMs, live ? emitText : undefined);
+    return { ...turn, streamed: live };
+  };
+  const reply = (turn: { content: string; streamed: boolean }) => {
+    if (!turn.streamed) emitText(turn.content);
+  };
+
   const stream = new ReadableStream<Uint8Array>({
     async start(streamController) {
       controller = streamController;
       started = true;
       try {
-        let turn = await completeChat(input, messages, 'auto', imageEnabled);
-        if (turn.toolCalls.length === 0 && intent === 'image' && imageEnabled) {
-          turn = await completeChat(input, messages, FORCED_IMAGE_TOOL, imageEnabled);
-        } else if (turn.toolCalls.length === 0 && (intent === 'database' || intent === 'storage')) {
-          turn = await completeChat(input, messages, 'required', imageEnabled);
+        const retryImage = intent === 'image' && imageEnabled;
+        let turn = await ask('auto', !retryImage && !domainTask);
+        if (turn.toolCalls.length === 0 && retryImage) {
+          turn = await ask(FORCED_IMAGE_TOOL, true);
+        } else if (turn.toolCalls.length === 0 && domainTask) {
+          turn = await ask('required', false);
         }
         let dbSuccess = false;
         let lastDbFailed = false;
@@ -233,7 +244,7 @@ export async function createImageToolResponse(input: {
         for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
           if (round > 0) {
             try {
-              turn = await completeChat(input, messages, nextChoice, imageEnabled, FOLLOW_UP_TIMEOUT_MS);
+              turn = await ask(nextChoice, !domainTask, FOLLOW_UP_TIMEOUT_MS);
             } catch {
               finish(streamController);
               return;
@@ -256,11 +267,11 @@ export async function createImageToolResponse(input: {
               nextChoice = 'required';
               continue;
             }
-            emitText(turn.content);
+            reply(turn);
             finish(streamController);
             return;
           }
-          emitText(turn.content);
+          reply(turn);
           messages.push(assistantToolMessage(turn));
           let emittedImages = false;
           let ranSideTool = false;
@@ -412,6 +423,7 @@ async function completeChat(
   toolChoice: ToolChoice,
   imageEnabled: boolean,
   timeoutMs = 120_000,
+  onText?: (text: string) => void,
 ): Promise<{ content: string; toolCalls: ToolCall[] }> {
   const tools = imageEnabled
     ? [GENERATE_IMAGE_TOOL, ...DATABASE_TOOLS, ...STORAGE_TOOLS]
@@ -438,9 +450,11 @@ async function completeChat(
   }
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('text/event-stream') && response.body) {
-    return readChatSse(response.body);
+    return readChatSse(response.body, onText);
   }
-  return readChatJson(await response.json().catch(() => null));
+  const turn = readChatJson(await response.json().catch(() => null));
+  onText?.(turn.content);
+  return turn;
 }
 
 function assistantToolMessage(turn: { content: string; toolCalls: ToolCall[] }): Record<string, unknown> {
@@ -621,7 +635,10 @@ function clampCount(value: unknown): number {
   return Math.min(4, Math.max(1, Math.floor(n)));
 }
 
-async function readChatSse(body: ReadableStream<Uint8Array>): Promise<{ content: string; toolCalls: ToolCall[] }> {
+async function readChatSse(
+  body: ReadableStream<Uint8Array>,
+  onText?: (text: string) => void,
+): Promise<{ content: string; toolCalls: ToolCall[] }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -644,7 +661,10 @@ async function readChatSse(body: ReadableStream<Uint8Array>): Promise<{ content:
       const delta = choice.delta ?? choice.message;
       if (!delta || typeof delta !== 'object') continue;
       const text = (delta as { content?: unknown }).content;
-      if (typeof text === 'string') content += text;
+      if (typeof text === 'string' && text) {
+        content += text;
+        onText?.(text);
+      }
       const toolCalls = (delta as { tool_calls?: unknown }).tool_calls;
       if (!Array.isArray(toolCalls)) continue;
       for (const item of toolCalls) {
