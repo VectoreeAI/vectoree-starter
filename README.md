@@ -35,7 +35,7 @@ docker compose up --build
 
 Compose sets `HOST=0.0.0.0` so the BFF accepts traffic from the web container. Local `npm run dev` still binds `127.0.0.1`. The web container proxies `/api` to `http://server:8787` (`API_PROXY`). The browser stays on port 5173, so the session cookie stays same-origin.
 
-Volume: `./.vectoree` → `/app/.vectoree` (project link and chat history). Compose does not mount `.env`; it passes it to the BFF as an optional `env_file`, so variables set there reach the container and a missing file is fine.
+Volume: `./.vectoree` → `/app/.vectoree` (project link). Chat history is stored in the connected project's database. Compose does not mount `.env`; it passes it to the BFF as an optional `env_file`, so variables set there reach the container and a missing file is fine.
 
 ### Cloud preview mode
 
@@ -47,7 +47,7 @@ DEPLOY_MODE=cloud
 VECTOREE_API_URL=http://host.docker.internal:7130   # Vectoree backend as seen from the BFF container
 ```
 
-On the Vectoree side, set `STARTER_PREVIEW_BASE_URL` to this app's URL (for example `http://127.0.0.1:5173/starter/`). Clicking Preview opens `…/starter/?ticket=…`. The BFF redeems the ticket once with `POST /api/system/starter/preview/redeem`, keeps the returned project key on the server, and gives the browser an httpOnly `ve_preview` cookie. Tickets are single use and expire after 60 seconds; the preview itself expires after 12 hours idle. Each visitor gets their own project, app users, and chat history (`.vectoree/conversations/<projectId>/<userId>/`).
+On the Vectoree side, set `STARTER_PREVIEW_BASE_URL` to this app's URL (for example `http://127.0.0.1:5173/starter/`). Clicking Preview opens `…/starter/?ticket=…`. The BFF redeems the ticket once with `POST /api/system/starter/preview/redeem`, keeps the returned project key on the server, and gives the browser an httpOnly `ve_preview` cookie. Tickets are single use and expire after 60 seconds; the preview itself expires after 12 hours idle. Each visitor gets their own project and app users. Chat history is written to that project's `starter_chats` table. Local mode uses the same table in the linked project.
 
 Previews live in BFF memory. Restarting the server drops them, and visitors see **Preview expired** until they click Preview in Vectoree again.
 

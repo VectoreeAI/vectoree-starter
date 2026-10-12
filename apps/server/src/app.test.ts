@@ -19,6 +19,109 @@ function tempRoot(): string {
   return dir;
 }
 
+type ChatRow = {
+  id: string;
+  user_id: string;
+  title: string;
+  titled_by_model: boolean;
+  messages: unknown;
+  created_at: string;
+  updated_at: string;
+};
+
+function memoryChats(fallback?: typeof fetch, tap?: (input: RequestInfo | URL, init?: RequestInit) => void): typeof fetch {
+  const buckets = new Map<string, { tables: Set<string>; rows: ChatRow[] }>();
+  let tick = Date.parse('2026-01-01T00:00:00.000Z');
+  const now = () => new Date((tick += 1000)).toISOString();
+  const bucket = (auth: string) => {
+    let found = buckets.get(auth);
+    if (!found) {
+      found = { tables: new Set(), rows: [] };
+      buckets.set(auth, found);
+    }
+    return found;
+  };
+  const matches = (row: ChatRow, url: URL) => {
+    for (const [key, value] of url.searchParams) {
+      if (key === 'limit' || key === 'offset' || key === 'order' || key === 'select') continue;
+      const expected = value.startsWith('eq.') ? value.slice(3) : value;
+      if (String(row[key as keyof ChatRow]) !== expected) return false;
+    }
+    return true;
+  };
+  return (async (input, init) => {
+    tap?.(input, init);
+    const url = new URL(String(input));
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const auth = new Headers(init?.headers).get('authorization') ?? '';
+    if (url.pathname === '/api/database/tables' && method === 'GET') {
+      return Response.json([...bucket(auth).tables]);
+    }
+    if (url.pathname === '/api/database/tables' && method === 'POST') {
+      const body = JSON.parse(String(init?.body)) as {
+        tableName?: string;
+        rlsEnabled?: boolean;
+        columns?: { columnName: string; type: string; isNullable: boolean }[];
+      };
+      assert.equal(body.tableName, 'starter_chats');
+      assert.equal(body.rlsEnabled, false);
+      assert.deepEqual(
+        (body.columns ?? []).map((column) => [column.columnName, column.type, column.isNullable]),
+        [
+          ['user_id', 'string', false],
+          ['title', 'string', false],
+          ['titled_by_model', 'boolean', false],
+          ['messages', 'json', false],
+        ],
+      );
+      const store = bucket(auth);
+      if (store.tables.has('starter_chats')) {
+        return Response.json({ message: 'table starter_chats already exists' }, { status: 400 });
+      }
+      store.tables.add('starter_chats');
+      return Response.json({ tableName: 'starter_chats' }, { status: 201 });
+    }
+    if (url.pathname === '/api/database/records/starter_chats') {
+      const store = bucket(auth);
+      if (method === 'GET') {
+        let matched = store.rows.filter((row) => matches(row, url));
+        if (url.searchParams.get('order') === 'updated_at.desc') {
+          matched = [...matched].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+        }
+        const limit = Number(url.searchParams.get('limit') ?? matched.length);
+        matched = matched.slice(0, limit);
+        const select = url.searchParams.get('select');
+        if (!select) return Response.json(matched);
+        const fields = select.split(',');
+        return Response.json(matched.map((row) => Object.fromEntries(fields.map((field) => [field, row[field as keyof ChatRow]]))));
+      }
+      if (method === 'POST') {
+        const incoming = JSON.parse(String(init?.body)) as ChatRow[];
+        const created = incoming.map((row) => {
+          const stamp = now();
+          return { ...row, titled_by_model: Boolean(row.titled_by_model), messages: row.messages ?? [], created_at: stamp, updated_at: stamp };
+        });
+        store.rows.push(...created);
+        return Response.json(created, { status: 201 });
+      }
+      if (method === 'PATCH') {
+        const patch = JSON.parse(String(init?.body)) as Partial<ChatRow>;
+        const stamp = now();
+        const updated = store.rows.filter((row) => matches(row, url));
+        for (const row of updated) Object.assign(row, patch, { updated_at: stamp });
+        return Response.json(updated);
+      }
+      if (method === 'DELETE') {
+        const removed = store.rows.filter((row) => matches(row, url));
+        store.rows = store.rows.filter((row) => !matches(row, url));
+        return Response.json(removed);
+      }
+    }
+    if (fallback) return fallback(input, init);
+    return new Response('not found', { status: 404 });
+  }) as typeof fetch;
+}
+
 afterEach(() => {
   clearAuthCooldowns();
   clearSessions();
@@ -534,7 +637,7 @@ describe('conversations', () => {
       projectId: 'proj_123',
       apiKey: secret,
     });
-    const app = createApp({ root, env: {}, ...(fetchImpl ? { fetchImpl } : {}) });
+    const app = createApp({ root, env: {}, fetchImpl: memoryChats(fetchImpl) });
     const sid = seedSession({ user: { id: 'u1', email: 'a@example.com' }, accessToken: 'app-jwt' });
     return { app, sid, root };
   }
@@ -1803,9 +1906,8 @@ describe('cloud preview', () => {
 
   it('sends each visitor only their own preview key upstream', async () => {
     const seen: Array<{ path: string; auth: string }> = [];
-    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchImpl = memoryChats(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
-      seen.push({ path: url.pathname, auth: new Headers(init?.headers).get('authorization') ?? '' });
       if (url.pathname === '/api/auth/users') {
         return Response.json({ user: { id: 'app-user', email: 'new@example.com' }, accessToken: 'app-access' });
       }
@@ -1818,7 +1920,10 @@ describe('cloud preview', () => {
         return sseEvents([{ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] }]);
       }
       return new Response('missing', { status: 404 });
-    }) as typeof fetch;
+    }, (input, init) => {
+      const url = new URL(String(input));
+      seen.push({ path: url.pathname, auth: new Headers(init?.headers).get('authorization') ?? '' });
+    });
     const app = createApp({ root: linkedRoot(), env: cloudEnv({ VECTOREE_API_KEY: secret }), fetchImpl });
 
     for (const [key, projectId, userId] of [
@@ -1929,9 +2034,9 @@ describe('cloud preview', () => {
     assert.equal(fs.existsSync(path.join(root, '.env')), false);
   });
 
-  it('keeps conversations apart per project and leaves the local path alone', async () => {
+  it('keeps conversations apart per project and per user in the backend table', async () => {
     const root = tempRoot();
-    const app = createApp({ root, env: cloudEnv() });
+    const app = createApp({ root, env: cloudEnv(), fetchImpl: memoryChats() });
     const cookieA = previewCookie(keyA, 'proj_a', 'same-user');
     const cookieB = previewCookie(keyB, 'proj_b', 'same-user');
     const make = async (cookie: string) =>
@@ -1950,18 +2055,29 @@ describe('cloud preview', () => {
     assert.deepEqual(await list(cookieA), [a.id]);
     assert.deepEqual(await list(cookieB), [b.id]);
     assert.equal((await app.request(`/api/conversations/${a.id}`, { headers: { Cookie: cookieB } })).status, 404);
-    assert.equal(fs.existsSync(path.join(root, '.vectoree', 'conversations', 'proj_a', 'same-user', 'index.json')), true);
+    assert.equal(fs.existsSync(path.join(root, '.vectoree', 'conversations')), false);
 
     const localRoot = tempRoot();
     writeProjectConfig(localRoot, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
-    const local = createApp({ root: localRoot, env: {} });
+    const local = createApp({ root: localRoot, env: {}, fetchImpl: memoryChats() });
     const sid = seedSession({ user: { id: 'u1', email: 'a@example.com' }, accessToken: 'app-jwt' });
-    await local.request('/api/conversations', {
-      method: 'POST',
-      headers: { Cookie: `${SESSION_COOKIE}=${sid}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force: true }),
-    });
-    assert.equal(fs.existsSync(path.join(localRoot, '.vectoree', 'conversations', 'u1', 'index.json')), true);
+    const other = seedSession({ user: { id: 'u2', email: 'b@example.com' }, accessToken: 'app-jwt-2' });
+    const created = (await (
+      await local.request('/api/conversations', {
+        method: 'POST',
+        headers: { Cookie: `${SESSION_COOKIE}=${sid}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: true, title: 'Local chat' }),
+      })
+    ).json()) as { id: string };
+    const hidden = (await (
+      await local.request('/api/conversations', { headers: { Cookie: `${SESSION_COOKIE}=${other}` } })
+    ).json()) as { conversations: { id: string }[] };
+    assert.equal(hidden.conversations.some((item) => item.id === created.id), false);
+    assert.equal(
+      (await local.request(`/api/conversations/${created.id}`, { headers: { Cookie: `${SESSION_COOKIE}=${other}` } })).status,
+      404,
+    );
+    assert.equal(fs.existsSync(path.join(localRoot, '.vectoree', 'conversations')), false);
   });
 });
 

@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Context } from 'hono';
 import type { Hono } from 'hono';
 import { ConfigError, type AppConfig } from './config.js';
 import { resolveScope } from './scope.js';
 import { readSession } from './session.js';
 import { FALLBACK_MODEL, readErrorMessage } from './vectoree.js';
+
+/** One row per chat. Every conversation for the connected project lives in this table. */
+const CHAT_TABLE = 'starter_chats';
 
 const MAX_CONVERSATIONS = 50;
 const MAX_MESSAGES = 40;
@@ -43,8 +44,25 @@ type Deps = {
   fetchImpl: typeof fetch;
 };
 
-/** projectId is set in cloud mode only; local history keeps the per-user path. */
-type Owner = { root: string; userId: string; projectId?: string };
+type Owner = {
+  fetchImpl: typeof fetch;
+  apiUrl: string;
+  apiKey: string;
+  projectId: string;
+  userId: string;
+};
+
+type ChatRow = {
+  id?: unknown;
+  user_id?: unknown;
+  title?: unknown;
+  titled_by_model?: unknown;
+  messages?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+};
+
+const ensured = new Map<string, Promise<void>>();
 
 const locks = new Map<string, Promise<void>>();
 
@@ -76,7 +94,7 @@ export function mountConversations(app: Hono, deps: Deps): void {
           updatedAt: now,
           messages: [],
         };
-        await writeConversation(owner, conversation, [conversationMeta(conversation), ...index]);
+        await writeConversation(owner, conversation);
         return conversation;
       });
       return c.json(conversationMeta(created), 201);
@@ -100,9 +118,8 @@ export function mountConversations(app: Hono, deps: Deps): void {
       const saved = await withLock(lockKey(owner), async () => {
         const current = await readConversation(owner, id);
         if (!current) return null;
-        const index = await readIndex(owner);
         const next: Conversation = { ...current, messages, updatedAt: new Date().toISOString() };
-        await writeConversation(owner, next, sortIndex(replaceMeta(index, next)));
+        await writeConversation(owner, next);
         return next;
       });
       if (!saved) return c.json({ message: 'Conversation not found' }, 404);
@@ -120,9 +137,8 @@ export function mountConversations(app: Hono, deps: Deps): void {
       const saved = await withLock(lockKey(owner), async () => {
         const current = await readConversation(owner, id);
         if (!current) return null;
-        const index = await readIndex(owner);
         const next: Conversation = { ...current, title, titledByModel: true, updatedAt: new Date().toISOString() };
-        await writeConversation(owner, next, sortIndex(replaceMeta(index, next)));
+        await writeConversation(owner, next);
         return next;
       });
       if (!saved) return c.json({ message: 'Conversation not found' }, 404);
@@ -133,16 +149,7 @@ export function mountConversations(app: Hono, deps: Deps): void {
   app.delete('/api/conversations/:id', (c) =>
     withUser(c, deps, async (owner) => {
       const id = conversationId(c.req.param('id'));
-      const removed = await withLock(lockKey(owner), async () => {
-        const index = await readIndex(owner);
-        if (!index.some((item) => item.id === id)) return false;
-        await writeIndex(
-          owner,
-          index.filter((item) => item.id !== id),
-        );
-        fs.rmSync(conversationPath(owner, id), { force: true });
-        return true;
-      });
+      const removed = await withLock(lockKey(owner), async () => deleteConversation(owner, id));
       if (!removed) return c.json({ message: 'Conversation not found' }, 404);
       return c.json({ ok: true });
     }),
@@ -162,14 +169,13 @@ export function mountConversations(app: Hono, deps: Deps): void {
       const saved = await withLock(lockKey(owner), async () => {
         const latest = await readConversation(owner, id);
         if (!latest) return null;
-        const index = await readIndex(owner);
         const next: Conversation = {
           ...latest,
           title,
           titledByModel: true,
           updatedAt: new Date().toISOString(),
         };
-        await writeConversation(owner, next, sortIndex(replaceMeta(index, next)));
+        await writeConversation(owner, next);
         return next;
       });
       if (!saved) return c.json({ message: 'Conversation not found' }, 404);
@@ -261,11 +267,15 @@ async function withUser(
   const config = resolveScope(c, deps.root, deps.env);
   const session = readSession(c);
   if (!session) return c.json({ message: 'Sign in required' }, 401);
+  if (!config.projectId || !config.apiKey) throw new ConfigError('Link a Vectoree project first');
   const owner: Owner = {
-    root: deps.root,
+    fetchImpl: deps.fetchImpl,
+    apiUrl: config.apiUrl,
+    apiKey: config.apiKey,
+    projectId: config.projectId,
     userId: session.user.id,
-    ...(config.conversationProjectId ? { projectId: config.conversationProjectId } : {}),
   };
+  await ensureChatTable(owner);
   return run(owner, config);
 }
 
@@ -341,18 +351,8 @@ function conversationMeta(conversation: Conversation): ConversationMeta {
   };
 }
 
-function replaceMeta(index: ConversationMeta[], conversation: Conversation): ConversationMeta[] {
-  const meta = conversationMeta(conversation);
-  const rest = index.filter((item) => item.id !== conversation.id);
-  return [meta, ...rest];
-}
-
-function sortIndex(index: ConversationMeta[]): ConversationMeta[] {
-  return [...index].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
-}
-
 function lockKey(owner: Owner): string {
-  return owner.projectId ? `${owner.projectId}:${owner.userId}` : owner.userId;
+  return `${owner.projectId}:${owner.userId}`;
 }
 
 async function withLock<T>(key: string, run: () => Promise<T>): Promise<T> {
@@ -372,63 +372,168 @@ async function withLock<T>(key: string, run: () => Promise<T>): Promise<T> {
   }
 }
 
-function safeSegment(value: string, label: string): string {
-  const safe = value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
-  if (!safe) throw new ConfigError(`Invalid ${label}`);
-  return safe;
+async function ensureChatTable(owner: Owner): Promise<void> {
+  const key = `${owner.apiUrl}\n${owner.projectId}`;
+  let pending = ensured.get(key);
+  if (!pending) {
+    pending = createChatTable(owner).catch((error: unknown) => {
+      ensured.delete(key);
+      throw error;
+    });
+    ensured.set(key, pending);
+  }
+  await pending;
 }
 
-function userDirectory(owner: Owner): string {
-  const base = path.join(owner.root, '.vectoree', 'conversations');
-  const user = safeSegment(owner.userId, 'user');
-  return owner.projectId ? path.join(base, safeSegment(owner.projectId, 'project'), user) : path.join(base, user);
-}
-
-function conversationPath(owner: Owner, id: string): string {
-  return path.join(userDirectory(owner), `${id}.json`);
+async function createChatTable(owner: Owner): Promise<void> {
+  const listed = await db(owner, `/api/database/tables`);
+  const names = Array.isArray(listed.data) ? listed.data.filter((item): item is string => typeof item === 'string') : [];
+  if (!listed.ok) throw dbError(owner, listed.data, 'Could not list tables');
+  if (names.includes(CHAT_TABLE)) return;
+  const created = await db(owner, '/api/database/tables', {
+    method: 'POST',
+    body: JSON.stringify({
+      tableName: CHAT_TABLE,
+      rlsEnabled: false,
+      columns: [
+        { columnName: 'user_id', type: 'string', isNullable: false, isUnique: false },
+        { columnName: 'title', type: 'string', isNullable: false, isUnique: false },
+        { columnName: 'titled_by_model', type: 'boolean', isNullable: false, isUnique: false },
+        { columnName: 'messages', type: 'json', isNullable: false, isUnique: false },
+      ],
+    }),
+  });
+  if (created.ok) return;
+  const message = readErrorMessage(created.data, 'Could not create starter_chats');
+  if (created.status === 400 && /already exists/i.test(message)) return;
+  throw dbError(owner, created.data, 'Could not create starter_chats');
 }
 
 async function readIndex(owner: Owner): Promise<ConversationMeta[]> {
-  const file = path.join(userDirectory(owner), 'index.json');
-  if (!fs.existsSync(file)) return [];
-  const parsed = parseJson(fs.readFileSync(file, 'utf8'));
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter(isMeta);
+  const params = new URLSearchParams({
+    user_id: `eq.${owner.userId}`,
+    order: 'updated_at.desc',
+    limit: String(MAX_CONVERSATIONS),
+    select: 'id,title,titled_by_model,created_at,updated_at',
+  });
+  const result = await db(owner, `/api/database/records/${CHAT_TABLE}?${params}`);
+  if (!result.ok) throw dbError(owner, result.data, 'Could not list chats');
+  return rows(result.data).flatMap((row) => {
+    const meta = rowMeta(row);
+    return meta ? [meta] : [];
+  });
 }
 
 async function readConversation(owner: Owner, id: string): Promise<Conversation | null> {
-  const file = conversationPath(owner, id);
-  if (!fs.existsSync(file)) return null;
-  const parsed = parseJson(fs.readFileSync(file, 'utf8'));
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const record = parsed as Conversation;
-  if (record.id !== id || !Array.isArray(record.messages)) return null;
-  return record;
+  const params = new URLSearchParams({
+    id: `eq.${id}`,
+    user_id: `eq.${owner.userId}`,
+    limit: '1',
+  });
+  const result = await db(owner, `/api/database/records/${CHAT_TABLE}?${params}`);
+  if (!result.ok) throw dbError(owner, result.data, 'Could not load the chat');
+  const row = rows(result.data)[0];
+  if (!row) return null;
+  return rowConversation(row, id);
 }
 
-async function writeConversation(owner: Owner, conversation: Conversation, index: ConversationMeta[]): Promise<void> {
-  const dir = userDirectory(owner);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeJson(path.join(dir, `${conversation.id}.json`), conversation);
-  writeJson(path.join(dir, 'index.json'), index);
+async function writeConversation(owner: Owner, conversation: Conversation): Promise<void> {
+  const existing = await readConversation(owner, conversation.id);
+  const body = {
+    title: conversation.title,
+    titled_by_model: Boolean(conversation.titledByModel),
+    messages: conversation.messages,
+  };
+  if (!existing) {
+    const created = await db(owner, `/api/database/records/${CHAT_TABLE}`, {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify([{ id: conversation.id, user_id: owner.userId, ...body }]),
+    });
+    if (!created.ok) throw dbError(owner, created.data, 'Could not save the chat');
+    return;
+  }
+  const params = new URLSearchParams({ id: `eq.${conversation.id}`, user_id: `eq.${owner.userId}` });
+  const updated = await db(owner, `/api/database/records/${CHAT_TABLE}?${params}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify(body),
+  });
+  if (!updated.ok) throw dbError(owner, updated.data, 'Could not save the chat');
 }
 
-async function writeIndex(owner: Owner, index: ConversationMeta[]): Promise<void> {
-  const dir = userDirectory(owner);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeJson(path.join(dir, 'index.json'), index);
+async function deleteConversation(owner: Owner, id: string): Promise<boolean> {
+  const params = new URLSearchParams({ id: `eq.${id}`, user_id: `eq.${owner.userId}` });
+  const removed = await db(owner, `/api/database/records/${CHAT_TABLE}?${params}`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=representation' },
+  });
+  if (!removed.ok) throw dbError(owner, removed.data, 'Could not delete the chat');
+  return Array.isArray(removed.data) && removed.data.length > 0;
 }
 
-function writeJson(file: string, value: unknown): void {
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, file);
+async function db(
+  owner: Owner,
+  path: string,
+  init: RequestInit = {},
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Bearer ${owner.apiKey}`);
+  headers.set('Accept', 'application/json');
+  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  let upstream: Response;
+  try {
+    upstream = await owner.fetchImpl(`${owner.apiUrl}${path}`, {
+      ...init,
+      headers,
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'network error';
+    throw new ConfigError(`Could not reach Vectoree at ${owner.apiUrl} (${redact(reason, owner.apiKey)})`, 502);
+  }
+  return { ok: upstream.ok, status: upstream.status, data: await readJsonSafe(upstream) };
 }
 
-function isMeta(value: unknown): value is ConversationMeta {
-  if (!value || typeof value !== 'object') return false;
-  const record = value as ConversationMeta;
-  return typeof record.id === 'string' && typeof record.title === 'string' && typeof record.updatedAt === 'string';
+function dbError(owner: Owner, data: unknown, fallback: string): ConfigError {
+  return new ConfigError(redact(readErrorMessage(data, fallback), owner.apiKey), 502);
+}
+
+function rows(data: unknown): ChatRow[] {
+  return Array.isArray(data) ? data.filter((item): item is ChatRow => Boolean(item) && typeof item === 'object') : [];
+}
+
+function rowMeta(row: ChatRow): ConversationMeta | null {
+  if (typeof row.id !== 'string' || typeof row.title !== 'string') return null;
+  const updatedAt = typeof row.updated_at === 'string' ? row.updated_at : '';
+  const createdAt = typeof row.created_at === 'string' ? row.created_at : updatedAt;
+  if (!updatedAt) return null;
+  return {
+    id: row.id,
+    title: row.title,
+    createdAt,
+    updatedAt,
+    ...(row.titled_by_model === true ? { titledByModel: true } : {}),
+  };
+}
+
+function rowConversation(row: ChatRow, id: string): Conversation | null {
+  const meta = rowMeta(row);
+  if (!meta || meta.id !== id) return null;
+  const messages = parseStoredMessages(row.messages);
+  if (!messages) return null;
+  return { ...meta, messages };
+}
+
+function parseStoredMessages(value: unknown): StoredMessage[] | null {
+  const parsed = typeof value === 'string' ? parseJson(value) : value;
+  if (!Array.isArray(parsed)) return null;
+  return parsed.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const record = item as StoredMessage;
+    if (typeof record.id !== 'string' || (record.role !== 'user' && record.role !== 'assistant')) return [];
+    return [record];
+  });
 }
 
 function parseJson(raw: string): unknown {
