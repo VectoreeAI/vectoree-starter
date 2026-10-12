@@ -12,7 +12,7 @@ services:
       PORT: "8787"
       NODE_ENV: production
       VECTOREE_API_URL: ${VECTOREE_API_URL:-https://vectoree.ai}
-      DEPLOY_MODE: ${DEPLOY_MODE:-local}
+      DEPLOY_MODE: ${DEPLOY_MODE:-cloud}
     volumes:
       - starter-data:/app/.vectoree
     healthcheck:

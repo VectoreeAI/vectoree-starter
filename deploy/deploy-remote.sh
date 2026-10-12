@@ -39,6 +39,7 @@ apply_dotenv STARTER_SERVER_IMAGE
 apply_dotenv STARTER_WEB_IMAGE
 apply_dotenv VECTOREE_API_URL
 apply_dotenv STARTER_WEB_PORT
+apply_dotenv DEPLOY_MODE
 
 if [[ -z "${STARTER_SERVER_IMAGE:-}" || -z "${STARTER_WEB_IMAGE:-}" ]]; then
   echo "Set STARTER_SERVER_IMAGE and STARTER_WEB_IMAGE in .env"
@@ -48,6 +49,7 @@ fi
 export STARTER_SERVER_IMAGE STARTER_WEB_IMAGE
 export VECTOREE_API_URL="${VECTOREE_API_URL:-https://vectoree.ai}"
 export STARTER_WEB_PORT="${STARTER_WEB_PORT:-5173}"
+export DEPLOY_MODE="${DEPLOY_MODE:-cloud}"
 
 COMPOSE_BIN=()
 setup_compose() {

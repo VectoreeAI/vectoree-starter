@@ -183,13 +183,14 @@ test:
       upsert_env STARTER_SERVER_IMAGE "$STARTER_SERVER_IMAGE"
       upsert_env STARTER_WEB_IMAGE "$STARTER_WEB_IMAGE"
       upsert_env VECTOREE_API_URL "$DEPLOY_API_BASE_URL"
+      upsert_env DEPLOY_MODE cloud
 
       echo "=== Disk space ==="
       df -h
       sudo docker system prune -f || true
 
       echo "=== Pull images / deploy ==="
-      export STARTER_SERVER_IMAGE STARTER_WEB_IMAGE VECTOREE_API_URL="$DEPLOY_API_BASE_URL"
+      export STARTER_SERVER_IMAGE STARTER_WEB_IMAGE VECTOREE_API_URL="$DEPLOY_API_BASE_URL" DEPLOY_MODE=cloud
       sudo -E bash "$DEPLOY_PATH/deploy/deploy-remote.sh"
       echo "=== Done ==="
       REMOTE
