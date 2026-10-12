@@ -1119,6 +1119,48 @@ describe('image tool', () => {
     assert.equal(text.includes(secret), false);
   });
 
+  it('forwards each text delta before the upstream reply finishes', async () => {
+    const encoder = new TextEncoder();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chunk = (content: string) => encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
+    const response = await createImageToolResponse({
+      apiUrl: 'https://vectoree.ai',
+      apiKey: secret,
+      model: 'vendor/chat',
+      messages: [{ role: 'user', content: 'tell me a story' }],
+      fetchImpl: (async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            async start(controller) {
+              controller.enqueue(chunk('Once '));
+              await held;
+              controller.enqueue(chunk('upon a time'));
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        )) as typeof fetch,
+    });
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    const first = decoder.decode((await reader.read()).value);
+    assert.match(first, /"content":"Once "/);
+    assert.equal(first.includes('upon a time'), false);
+    release();
+    let rest = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rest += decoder.decode(value, { stream: true });
+    }
+    assert.match(rest, /"content":"upon a time"/);
+    assert.match(rest, /\[DONE\]/);
+  });
+
   it('polls a 202 image job and prefers b64 data urls', async () => {
     let polls = 0;
     const response = await createImageToolResponse({
