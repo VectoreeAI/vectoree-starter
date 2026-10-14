@@ -2390,6 +2390,40 @@ describe('preview auth', () => {
     assert.equal(calls, 3);
   });
 
+  it('reports an inactive wallet on the first resend instead of retrying into the email cooldown', async () => {
+    const calls: string[] = [];
+    const root = tempRoot();
+    writeProjectConfig(root, { apiUrl: 'https://vectoree.ai', projectId: 'proj_123', apiKey: secret });
+    const app = createApp({
+      root,
+      env: {},
+      walletRetryDelaysMs: [0, 0],
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        calls.push(url.pathname);
+        if (url.pathname === '/api/auth/users') {
+          return Response.json({ error: 'AUTH_EMAIL_EXISTS', message: 'Email already registered' }, { status: 409 });
+        }
+        if (calls.filter((item) => item === url.pathname).length > 1) {
+          return Response.json(
+            { message: 'Please wait 56 seconds before requesting another code for this email' },
+            { status: 429 },
+          );
+        }
+        return Response.json(
+          { code: 'BILLING_WALLET_NOT_ACTIVATED', message: 'Organization wallet is not activated' },
+          { status: 402 },
+        );
+      }) as typeof fetch,
+    });
+    const res = await start(app, { email: 'known@example.com' });
+    const body = (await res.json()) as { message?: string; code?: string };
+    assert.equal(res.status, 402);
+    assert.equal(body.code, 'BILLING_WALLET_NOT_ACTIVATED');
+    assert.equal(body.message, 'Organization wallet is not activated');
+    assert.deepEqual(calls, ['/api/auth/users', '/api/auth/email/send-verification']);
+  });
+
   it('does not retry a wallet sentence that is not a 402', async () => {
     let calls = 0;
     const root = tempRoot();

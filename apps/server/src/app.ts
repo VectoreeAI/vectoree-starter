@@ -338,7 +338,8 @@ async function startEmailAuth(c: Context, deps: AppDeps): Promise<Response> {
   const registered = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.register}?client_type=server`, { email, password }, delays);
   const registeredData = registered.data;
   if (isEmailTaken(registered.status, registeredData)) {
-    const resent = await postAuthUntilWalletReady(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, { email }, delays);
+    // Vectoree starts its 60s per-email cooldown before the wallet check, so a retry here only turns the 402 into a 429.
+    const resent = await postAuth(fetchImpl, config, `${AUTH_PATHS.resend}?client_type=server`, { email });
     if (isWalletInactiveResponse(resent.status, resent.data)) return walletInactive(c, resent.data);
     if (!resent.ok) {
       return c.json({ message: readErrorMessage(resent.data, 'Could not resend the code') }, statusOf(resent.status));
