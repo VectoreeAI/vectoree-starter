@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  assetUrl,
   generateConversationTitle,
   getConversation,
   saveConversation,
@@ -124,7 +125,8 @@ export function ChatScreen({
   async function persist(id: string, next: ThreadMessage[], nameIfNeeded: boolean) {
     const stored = next.map(toStored);
     try {
-      await saveConversation(id, stored);
+      const saved = await saveConversation(id, stored);
+      if (saved.messages) showMessages(withSavedImages(messagesRef.current, saved.messages), id);
       onSaved(id);
     } catch (err) {
       if (liveRef.current === id) setError(err instanceof Error ? err.message : t('saveChatFail'));
@@ -251,7 +253,7 @@ export function ChatScreen({
                   ))
                 : null}
               {item.generated?.map((generated) => (
-                <img key={generated.url} className="gen" src={generated.url} alt={t('generated')} />
+                <img key={generated.url} className="gen" src={assetUrl(generated.url)} alt={t('generated')} />
               ))}
               <div className="prose">
                 {item.content}
@@ -330,19 +332,40 @@ function toStored(item: ThreadMessage): ConversationMessage {
     id: item.id,
     role: item.role,
     content: item.content,
-    ...(item.image?.data ? { image: { mediaType: item.image.mediaType, data: item.image.data } } : {}),
+    ...(item.image?.url
+      ? { image: { url: item.image.url } }
+      : item.image?.data
+        ? { image: { mediaType: item.image.mediaType, data: item.image.data } }
+        : {}),
     ...(item.generated?.length ? { generated: item.generated.map((image) => ({ url: image.url })) } : {}),
   };
 }
 
+/** Swaps inline image data for the saved addresses so later saves do not upload it again. */
+function withSavedImages(current: ThreadMessage[], saved: ConversationMessage[]): ThreadMessage[] {
+  const byId = new Map(saved.map((item) => [item.id, item]));
+  return current.map((item) => {
+    const match = byId.get(item.id);
+    if (!match) return item;
+    return {
+      ...item,
+      ...(item.image && match.image?.url ? { image: { ...item.image, url: match.image.url } } : {}),
+      ...(match.generated?.length ? { generated: match.generated } : {}),
+    };
+  });
+}
+
 function hydrate(item: ConversationMessage): ThreadMessage {
+  const image = item.image;
   return {
     id: item.id,
     role: item.role,
     content: item.content,
-    ...(item.image?.data
-      ? { image: { mediaType: item.image.mediaType, data: item.image.data, previewUrl: `data:${item.image.mediaType};base64,${item.image.data}` } }
-      : {}),
+    ...(image?.url
+      ? { image: { mediaType: image.mediaType ?? '', data: '', previewUrl: assetUrl(image.url), url: image.url } }
+      : image?.data && image.mediaType
+        ? { image: { mediaType: image.mediaType, data: image.data, previewUrl: `data:${image.mediaType};base64,${image.data}` } }
+        : {}),
     ...(item.generated?.length ? { generated: item.generated } : {}),
   };
 }

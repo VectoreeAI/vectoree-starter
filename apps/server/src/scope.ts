@@ -7,8 +7,6 @@ export const PREVIEW_REQUIRED = 'preview_required';
 
 export type ProjectScope = AppConfig & {
   apiKey: string;
-  /** Cloud only. Conversations are stored per project. */
-  conversationProjectId?: string;
   previewId?: string;
 };
 
@@ -21,7 +19,6 @@ export function resolveScope(c: Context, root: string, env: NodeJS.ProcessEnv): 
       apiKey: preview.apiKey,
       projectId: preview.projectId,
       linked: true,
-      conversationProjectId: preview.projectId,
       previewId: preview.id,
     };
   }
