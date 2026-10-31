@@ -28,4 +28,5 @@ services:
       - server
 
 volumes:
-  starter-data:
+  # Keep the explicit {}: Vectoree rewrites this file, and a bare `starter-data:` comes out as '', which Compose rejects.
+  starter-data: {}
