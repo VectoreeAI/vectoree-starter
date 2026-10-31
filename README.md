@@ -27,11 +27,13 @@ npm run dev
 Requirements: Docker with Compose. This does not replace the host link step.
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 ```
 
 - Web: http://localhost:5173
 - BFF inside the compose network: `server:8787` (not published on the host)
+
+`docker-compose.yml` is the file Vectoree hosting reads when you import this repo from Git or a zip. It must pass the platform compose policy, so it publishes no ports, reads no host files, and sets no `container_name`. The host port, `.env`, and the `./.vectoree` bind mount live in `docker-compose.local.yml`, which only your local `docker compose` reads. Plain `docker compose up` still builds and starts both services, but nothing is published on the host and the project link is kept in the `starter-data` volume instead of `./.vectoree`.
 
 Compose sets `HOST=0.0.0.0` so the BFF accepts traffic from the web container. Local `npm run dev` still binds `127.0.0.1`. The web container proxies `/api` to `http://server:8787` (`API_PROXY`). The browser stays on port 5173, so the session cookie stays same-origin.
 
@@ -108,4 +110,4 @@ Restarting the BFF clears in-memory sessions. Sign in again.
 | `npm run dev` | Web + BFF |
 | `npm run typecheck` | Typecheck both workspaces |
 | `npm test` | BFF unit tests (no network) |
-| `docker compose up --build` | Web + BFF in containers |
+| `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build` | Web + BFF in containers |
