@@ -18,5 +18,8 @@ CMD ["npm", "run", "start", "-w", "@vectoree-starter/server"]
 
 FROM build AS web
 ENV API_PROXY=http://server:8787
+# vite preview writes its bundled config to node_modules/.vite-temp at startup.
+RUN mkdir -p node_modules/.vite-temp && chown node:node node_modules/.vite-temp
+USER node
 EXPOSE 5173
 CMD ["npm", "run", "preview", "-w", "@vectoree-starter/web", "--", "--host", "0.0.0.0", "--port", "5173", "--strictPort"]
