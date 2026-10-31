@@ -1,30 +1,31 @@
+# Vectoree 托管从 GIT / ZIP 导入时只读这一个文件，必须符合平台 compose 策略：
+# 不发布端口、不读宿主文件、不写 container_name、镜像要么 build 要么固定 digest。
+# 本机开发的端口、.env、./.vectoree 挂载放在 docker-compose.local.yml：
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+
 services:
   server:
-    image: vectoree-starter-server:latest
-    container_name: vectoree-starter-server
     restart: unless-stopped
     build:
       context: .
       target: server
-    env_file:
-      - path: .env
-        required: false
     environment:
       HOST: 0.0.0.0
       PORT: "8787"
     volumes:
-      - ./.vectoree:/app/.vectoree
+      - starter-data:/app/.vectoree
 
   web:
-    image: vectoree-starter-web:latest
-    container_name: vectoree-starter-web
     restart: unless-stopped
     build:
       context: .
       target: web
     environment:
       API_PROXY: http://server:8787
-    ports:
-      - "127.0.0.1:5173:5173"
+    expose:
+      - "5173"
     depends_on:
       - server
+
+volumes:
+  starter-data:

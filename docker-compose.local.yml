@@ -1,0 +1,18 @@
+# 本机开发叠加层，Vectoree 托管导入不会读这个文件：
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+
+services:
+  server:
+    image: vectoree-starter-server:latest
+    container_name: vectoree-starter-server
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./.vectoree:/app/.vectoree
+
+  web:
+    image: vectoree-starter-web:latest
+    container_name: vectoree-starter-web
+    ports:
+      - "127.0.0.1:5173:5173"
