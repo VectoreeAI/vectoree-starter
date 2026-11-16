@@ -651,91 +651,50 @@ describe('console connect', () => {
     assert.equal(fs.existsSync(path.join(root, '.vectoree', 'config.json')), false);
   });
 
-  it('starts a device login on a hosted origin and keeps the device code on the server', async () => {
+  it('uses PKCE on a hosted origin and forwards the human-check token', async () => {
     const root = tempRoot();
-    const deviceCode = 'server-secret-device-code';
-    let polls = 0;
+    let turnstileHeader: string | null = null;
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith('/api/system/auth/cli/device/code')) {
-        const body = JSON.parse(String(init?.body ?? '{}')) as { redirect_uri?: string };
-        assert.equal(body.redirect_uri, undefined);
-        return Response.json({
-          device_code: deviceCode,
-          user_code: 'ABCD-EFGH',
-          verification_uri: 'https://vectoree.ai/cli/device',
-          verification_uri_complete: 'https://vectoree.ai/cli/device?user_code=ABCD-EFGH',
-          expires_in: 900,
-          interval: 1,
-        });
+      if (url.endsWith('/api/system/auth/public-config')) {
+        return Response.json({ turnstileSiteKey: 'site-key' });
       }
-      if (url.endsWith('/api/system/auth/cli/device/token')) {
-        polls += 1;
-        const body = JSON.parse(String(init?.body)) as { device_code?: string };
-        assert.equal(body.device_code, deviceCode);
-        if (polls === 1) {
-          return Response.json(
-            { error: 'authorization_pending', error_description: 'User has not approved the device code yet' },
-            { status: 400 },
-          );
-        }
-        return Response.json({ accessToken: access, refreshToken: refresh });
+      if (url.includes('/api/gateway/keys')) {
+        turnstileHeader = new Headers(init?.headers).get('x-turnstile-token');
       }
       return consoleFetch(root)(input, init);
     }) as typeof fetch;
     const app = createApp({ root, env: {}, fetchImpl });
-    const started = await app.request('/api/setup/connect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        openBrowser: false,
-        apiUrl: 'https://vectoree.ai',
-        redirectOrigin: 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/',
-      }),
-    });
-    const startedText = await started.text();
-    assert.equal(started.status, 200, startedText);
-    assert.equal(startedText.includes(deviceCode), false);
-    assert.deepEqual(JSON.parse(startedText), {
-      status: 'device',
-      apiUrl: 'https://vectoree.ai',
-      userCode: 'ABCD-EFGH',
-      verificationUri: 'https://vectoree.ai/cli/device?user_code=ABCD-EFGH',
-      intervalSeconds: 1,
-    });
+    const origin = 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/';
+    const { authorize, state } = await startLogin(app, origin);
+    assert.equal(
+      authorize.searchParams.get('redirect_uri'),
+      'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/api/setup/callback',
+    );
 
-    const waiting = await app.request('/api/setup/device', { method: 'POST' });
-    const waitingText = await waiting.text();
-    assert.equal(waiting.status, 200, waitingText);
-    assert.equal(JSON.parse(waitingText).status, 'device');
-    assert.equal(waitingText.includes(deviceCode), false);
-
-    const approved = await app.request('/api/setup/device', { method: 'POST' });
-    const approvedText = await approved.text();
-    assert.equal(approved.status, 200, approvedText);
-    assert.equal(JSON.parse(approvedText).status, 'authorized');
-    assert.equal(approvedText.includes(access), false);
-    assert.equal(approvedText.includes(deviceCode), false);
-
-    const listed = await app.request('/api/setup/projects');
-    assert.equal(listed.status, 200);
-    const again = await app.request('/api/setup/device', { method: 'POST' });
-    assert.equal(again.status, 409);
+    const callback = await app.request(`/api/setup/callback?code=auth-code&state=${state}`);
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get('location'), 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/');
+    const token = await app.request('/api/setup/token', { method: 'POST' });
+    assert.equal(token.status, 200);
+    const check = await app.request('/api/setup/turnstile');
+    assert.equal(check.status, 200);
+    assert.deepEqual(await check.json(), { siteKey: 'site-key' });
 
     const sessionFile = path.join(root, '.vectoree', 'console-session.json');
-    const stored = fs.readFileSync(sessionFile, 'utf8');
-    assert.equal(stored.includes(access), true);
-    assert.equal(stored.includes(deviceCode), false);
+    assert.equal(fs.readFileSync(sessionFile, 'utf8').includes(access), true);
     const restarted = createApp({ root, env: {}, fetchImpl });
     const linked = await restarted.request('/api/setup/link', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId }),
+      body: JSON.stringify({ projectId, turnstileToken: 'cf-token' }),
     });
     const linkedText = await linked.text();
     assert.equal(linked.status, 200, linkedText);
     assert.equal(JSON.parse(linkedText).projectId, projectId);
     assert.equal(linkedText.includes(access), false);
+    assert.equal(linkedText.includes('cf-token'), false);
+    assert.equal(turnstileHeader, 'cf-token');
     assert.equal(fs.existsSync(sessionFile), false);
   });
 
@@ -2293,6 +2252,7 @@ describe('cloud preview', () => {
       ['POST', '/api/setup/token'],
       ['POST', '/api/setup/device'],
       ['GET', '/api/setup/projects'],
+      ['GET', '/api/setup/turnstile'],
       ['POST', '/api/setup/link'],
       ['GET', '/api/settings'],
       ['PATCH', '/api/settings'],
