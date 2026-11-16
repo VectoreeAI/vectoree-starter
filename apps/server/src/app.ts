@@ -191,8 +191,8 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(status);
   });
 
-  app.get('/api/setup/callback', (c) => {
-    const result = linker.finishCallback({
+  app.get('/api/setup/callback', async (c) => {
+    const result = await linker.finishCallback({
       code: c.req.query('code') ?? '',
       state: c.req.query('state') ?? '',
       error: c.req.query('error'),

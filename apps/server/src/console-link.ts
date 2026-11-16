@@ -51,7 +51,7 @@ type PendingDevice = {
   expiresAt: number;
 };
 
-type ConsoleSession = { apiUrl: string; accessToken: string; refreshToken?: string };
+type ConsoleSession = { apiUrl: string; accessToken: string; refreshToken?: string; appUrl?: string };
 
 function consoleSessionFile(root: string): string {
   return path.join(root, '.vectoree', 'console-session.json');
@@ -66,6 +66,7 @@ function writeConsoleSession(root: string, session: ConsoleSession): void {
     apiUrl: session.apiUrl,
     accessToken: session.accessToken,
     ...(session.refreshToken ? { refreshToken: session.refreshToken } : {}),
+    ...(session.appUrl ? { appUrl: session.appUrl } : {}),
   };
   fs.writeFileSync(tmp, `${JSON.stringify(body)}\n`, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, file);
@@ -83,7 +84,8 @@ function readConsoleSession(root: string): ConsoleSession | null {
     const accessToken = text(record.accessToken);
     if (!apiUrl || !accessToken) return null;
     const refreshToken = text(record.refreshToken);
-    return { apiUrl, accessToken, ...(refreshToken ? { refreshToken } : {}) };
+    const appUrl = text(record.appUrl);
+    return { apiUrl, accessToken, ...(refreshToken ? { refreshToken } : {}), ...(appUrl ? { appUrl } : {}) };
   } catch {
     return null;
   }
@@ -170,7 +172,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
   let polling: Promise<ConnectPublic> | null = null;
   let linking: Promise<ConnectPublic> | null = null;
 
-  return {
+  const linker = {
     snapshot(): ConnectPublic {
       const pending = syncLogin();
       if (pending && !pending.code && Date.now() > pending.expiresAt) {
@@ -222,24 +224,20 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       return { ...state };
     },
 
-    finishCallback(query: {
+    async finishCallback(query: {
       code: string;
       state: string;
       error?: string;
       errorDescription?: string;
-    }): { status: 302; location: string } | { status: 400; html: string } {
+    }): Promise<{ status: 302; location: string } | { status: 400; html: string }> {
       const current = syncLogin();
+      loadSession();
       if (!current || query.state !== current.state) {
+        if (session?.appUrl) return { status: 302, location: session.appUrl };
+        if (current) return { status: 302, location: current.appUrl };
         return { status: 400, html: '<p>Invalid Vectoree login callback.</p>' };
       }
-      if (current.code) {
-        if (query.code === current.code) {
-          state = { status: 'callback', apiUrl: current.apiUrl };
-          return { status: 302, location: current.appUrl };
-        }
-        return { status: 400, html: '<p>Invalid Vectoree login callback.</p>' };
-      }
-      if (query.error || !query.code || Date.now() > current.expiresAt) {
+      if (query.error || (!query.code && !current.code) || (Date.now() > current.expiresAt && !current.code)) {
         clearPendingLogin(options.root);
         login = null;
         const message = query.error
@@ -250,10 +248,21 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
         state = { status: 'error', apiUrl: current.apiUrl, message };
         return { status: 302, location: current.appUrl };
       }
-      const received: PendingLogin = { ...current, code: query.code };
-      login = received;
-      writePendingLogin(options.root, received);
-      state = { status: 'callback', apiUrl: current.apiUrl };
+      if (current.code && query.code !== current.code) {
+        if (session?.appUrl) return { status: 302, location: session.appUrl };
+        state = { status: 'error', apiUrl: current.apiUrl, message: 'No Console login to finish. Log in again.' };
+        return { status: 302, location: current.appUrl };
+      }
+      if (!current.code) {
+        const received: PendingLogin = { ...current, code: query.code };
+        login = received;
+        writePendingLogin(options.root, received);
+      }
+      try {
+        await linker.exchange();
+      } catch {
+        // The failed exchange is stored for the app page. The browser still leaves this URL.
+      }
       return { status: 302, location: current.appUrl };
     },
 
@@ -311,11 +320,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       if (exchanging) return exchanging;
       loadSession();
       const current = syncLogin();
-      if (session) {
-        if (current) {
-          clearPendingLogin(options.root);
-          login = null;
-        }
+      if (session && !current?.code) {
         state = { status: 'authorized', apiUrl: session.apiUrl };
         return Promise.resolve({ ...state });
       }
@@ -332,7 +337,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
           });
           const latest = readPendingLogin(options.root);
           if (latest && latest.state !== current.state) return publicConnect(state);
-          rememberSession({ apiUrl: current.apiUrl, ...tokens });
+          rememberSession({ apiUrl: current.apiUrl, appUrl: current.appUrl, ...tokens });
           state = { status: 'authorized', apiUrl: current.apiUrl };
           return { ...state };
         } catch (error) {
@@ -455,6 +460,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       return linking;
     },
   };
+  return linker;
 
   function syncLogin(): PendingLogin | null {
     login = readPendingLogin(options.root);
@@ -498,6 +504,11 @@ function publicConnect(state: ConnectPublic): ConnectPublic {
   return { ...state };
 }
 
+function hostedConsoleHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return host === 'vectoree.site' || host.endsWith('.vectoree.site') || HOSTED_CONSOLE_HOSTS.has(host);
+}
+
 export function isHostedConsoleOrigin(origin: string | undefined): boolean {
   const trimmed = origin?.trim();
   if (!trimmed) return false;
@@ -509,8 +520,7 @@ export function isHostedConsoleOrigin(origin: string | undefined): boolean {
   }
   if (url.protocol !== 'https:') return false;
   if (url.port !== '' && url.port !== '443') return false;
-  const host = url.hostname.toLowerCase();
-  return host === 'vectoree.site' || host.endsWith('.vectoree.site') || HOSTED_CONSOLE_HOSTS.has(host);
+  return hostedConsoleHost(url.hostname);
 }
 
 function appUrlFromCallback(callbackUri: string): string {
@@ -528,10 +538,14 @@ export function callbackUriFromOrigin(origin: string | undefined): string | null
   } catch {
     throw new ConfigError('Open Vectoree Starter at http://127.0.0.1:5173 before connecting');
   }
+  if (url.protocol === 'http:' && (url.port === '' || url.port === '80') && hostedConsoleHost(url.hostname)) {
+    url.protocol = 'https:';
+    url.port = '';
+  }
   const basePath = url.pathname.replace(/\/$/, '');
   const callback = `${url.origin}${basePath}/api/setup/callback`;
   const loopback = url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname) && Boolean(url.port);
-  if (!loopback && !isHostedConsoleOrigin(trimmed)) {
+  if (!loopback && !isHostedConsoleOrigin(url.origin)) {
     throw new ConfigError('Connect from the forwarded address http://127.0.0.1:5173');
   }
   return callback;

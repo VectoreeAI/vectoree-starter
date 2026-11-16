@@ -92,6 +92,7 @@ const copy = {
     loginFirst: 'Log in to Vectoree first',
     loginTimeout: 'Console login timed out. Log in again.',
     loginAgain: 'This login did not finish. Log in again.',
+    loginOrigin: 'Open this page with https, then log in.',
     deviceNote:
       'This server cannot open a browser. Open the link on your own computer, sign in to Vectoree, and approve the code. This page continues on its own.',
     deviceOpen: 'Open Vectoree',
@@ -297,6 +298,7 @@ const copy = {
     loginFirst: '请先登录 Vectoree',
     loginTimeout: '登录超时了，请再登录一次',
     loginAgain: '这次登录没有完成，请再登录一次',
+    loginOrigin: '请用 https 打开这个页面后再登录',
     deviceNote: '云端服务器打不开浏览器。在你自己的电脑上打开链接，登录 Vectoree 并确认这个验证码。确认后这个页面会自动继续。',
     deviceOpen: '打开 Vectoree',
     deviceWaiting: '等待确认…',
