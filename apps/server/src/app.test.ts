@@ -721,6 +721,22 @@ describe('console connect', () => {
     assert.equal(listed.status, 200);
     const again = await app.request('/api/setup/device', { method: 'POST' });
     assert.equal(again.status, 409);
+
+    const sessionFile = path.join(root, '.vectoree', 'console-session.json');
+    const stored = fs.readFileSync(sessionFile, 'utf8');
+    assert.equal(stored.includes(access), true);
+    assert.equal(stored.includes(deviceCode), false);
+    const restarted = createApp({ root, env: {}, fetchImpl });
+    const linked = await restarted.request('/api/setup/link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    });
+    const linkedText = await linked.text();
+    assert.equal(linked.status, 200, linkedText);
+    assert.equal(JSON.parse(linkedText).projectId, projectId);
+    assert.equal(linkedText.includes(access), false);
+    assert.equal(fs.existsSync(sessionFile), false);
   });
 
   it('still rejects a hosted name that is not a Vectoree site', async () => {
