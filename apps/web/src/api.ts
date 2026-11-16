@@ -10,8 +10,11 @@ export type SetupStatus = {
 };
 
 export type ConnectStatus = {
-  status: 'idle' | 'pending' | 'callback' | 'authorized' | 'linked' | 'error';
+  status: 'idle' | 'pending' | 'device' | 'callback' | 'authorized' | 'linked' | 'error';
   authorizeUrl?: string;
+  userCode?: string;
+  verificationUri?: string;
+  intervalSeconds?: number;
   message?: string;
   apiUrl?: string;
   projectId?: string;
@@ -109,6 +112,10 @@ export function getConnect(): Promise<ConnectStatus> {
 
 export function exchangeConsoleCode(): Promise<ConnectStatus> {
   return request('/api/setup/token', { method: 'POST' });
+}
+
+export function pollConsoleDevice(): Promise<ConnectStatus> {
+  return request('/api/setup/device', { method: 'POST' });
 }
 
 export function listConsoleProjects(): Promise<{ projects: ConsoleProject[] }> {

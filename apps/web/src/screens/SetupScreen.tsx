@@ -4,6 +4,7 @@ import {
   getConnect,
   linkProject,
   listConsoleProjects,
+  pollConsoleDevice,
   startConnect,
   type ConsoleProject,
 } from '../api';
@@ -26,7 +27,7 @@ function groupByOrganization(projects: ConsoleProject[]): ProjectGroup[] {
   return [...groups.values()];
 }
 
-type Phase = 'checking' | 'login' | 'redirecting' | 'signingIn' | 'fetching' | 'choose' | 'linking' | 'done';
+type Phase = 'checking' | 'login' | 'redirecting' | 'device' | 'signingIn' | 'fetching' | 'choose' | 'linking' | 'done';
 
 export function SetupScreen({ onLinked }: { onLinked: () => void }) {
   const { t } = useI18n();
@@ -37,6 +38,9 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
   const [linkedName, setLinkedName] = useState('');
   const [error, setError] = useState('');
   const [seconds, setSeconds] = useState(3);
+  const [userCode, setUserCode] = useState('');
+  const [verificationUri, setVerificationUri] = useState('');
+  const [intervalSeconds, setIntervalSeconds] = useState(2);
   const resumed = useRef(false);
   const onLinkedRef = useRef(onLinked);
   onLinkedRef.current = onLinked;
@@ -47,6 +51,10 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
     void getConnect()
       .then((status) => {
         if (status.apiUrl) setApiUrl(status.apiUrl);
+        if (status.status === 'device' && status.userCode && status.verificationUri) {
+          showDevice(status.userCode, status.verificationUri, status.intervalSeconds);
+          return;
+        }
         if (status.status === 'callback') return signIn();
         if (status.status === 'authorized') return fetchProjects();
         if (status.status === 'error') setError(status.message || t('loginFail'));
@@ -100,6 +108,46 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
     }
   }
 
+  function showDevice(code: string, uri: string, interval: number | undefined) {
+    setUserCode(code);
+    setVerificationUri(uri);
+    setIntervalSeconds(interval && interval >= 1 ? interval : 2);
+    setPhase('device');
+  }
+
+  useEffect(() => {
+    if (phase !== 'device') return undefined;
+    let stopped = false;
+    let timer = 0;
+    const wait = Math.max(2, intervalSeconds) * 1000;
+    const tick = async () => {
+      try {
+        const status = await pollConsoleDevice();
+        if (stopped) return;
+        if (status.status === 'authorized') {
+          await fetchProjects();
+          return;
+        }
+        if (status.status === 'error') {
+          setError(status.message || t('loginFail'));
+          setPhase('login');
+          return;
+        }
+        setError('');
+        if (status.userCode) setUserCode(status.userCode);
+        if (status.verificationUri) setVerificationUri(status.verificationUri);
+      } catch (err) {
+        if (!stopped) setError(err instanceof Error ? err.message : t('loginFail'));
+      }
+      if (!stopped) timer = window.setTimeout(() => void tick(), wait);
+    };
+    timer = window.setTimeout(() => void tick(), wait);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [phase, intervalSeconds]);
+
   async function onLogin() {
     setPhase('redirecting');
     setError('');
@@ -109,6 +157,10 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
         openBrowser: false,
         redirectOrigin: new URL(import.meta.env.BASE_URL, window.location.origin).href,
       });
+      if (status.status === 'device' && status.userCode && status.verificationUri) {
+        showDevice(status.userCode, status.verificationUri, status.intervalSeconds);
+        return;
+      }
       if (!status.authorizeUrl) throw new Error(status.message || t('loginFail'));
       window.location.assign(status.authorizeUrl);
     } catch (err) {
@@ -213,6 +265,24 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
             <button className="btn-ghost as-typed" type="button" onClick={() => void onLogin()} disabled={busy}>
               {t('switchAccount')}
             </button>
+          </div>
+        </div>
+      </Stage>
+    );
+  }
+
+  if (phase === 'device') {
+    return (
+      <Stage title={t('linkProject')} gloss={t('setupGloss')} sticker={t('consoleLogin')}>
+        <div className="panel stack">
+          <p className="note">{t('deviceNote')}</p>
+          <p className="device-code">{userCode}</p>
+          {errorBox}
+          <p className="note">{t('deviceWaiting')}</p>
+          <div className="row">
+            <a className="btn as-typed" href={verificationUri} target="_blank" rel="noreferrer">
+              {t('deviceOpen')}
+            </a>
           </div>
         </div>
       </Stage>

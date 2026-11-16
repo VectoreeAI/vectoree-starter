@@ -651,6 +651,90 @@ describe('console connect', () => {
     assert.equal(fs.existsSync(path.join(root, '.vectoree', 'config.json')), false);
   });
 
+  it('starts a device login on a hosted origin and keeps the device code on the server', async () => {
+    const root = tempRoot();
+    const deviceCode = 'server-secret-device-code';
+    let polls = 0;
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/api/system/auth/cli/device/code')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { redirect_uri?: string };
+        assert.equal(body.redirect_uri, undefined);
+        return Response.json({
+          device_code: deviceCode,
+          user_code: 'ABCD-EFGH',
+          verification_uri: 'https://vectoree.ai/cli/device',
+          verification_uri_complete: 'https://vectoree.ai/cli/device?user_code=ABCD-EFGH',
+          expires_in: 900,
+          interval: 1,
+        });
+      }
+      if (url.endsWith('/api/system/auth/cli/device/token')) {
+        polls += 1;
+        const body = JSON.parse(String(init?.body)) as { device_code?: string };
+        assert.equal(body.device_code, deviceCode);
+        if (polls === 1) {
+          return Response.json(
+            { error: 'authorization_pending', error_description: 'User has not approved the device code yet' },
+            { status: 400 },
+          );
+        }
+        return Response.json({ accessToken: access, refreshToken: refresh });
+      }
+      return consoleFetch(root)(input, init);
+    }) as typeof fetch;
+    const app = createApp({ root, env: {}, fetchImpl });
+    const started = await app.request('/api/setup/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        openBrowser: false,
+        apiUrl: 'https://vectoree.ai',
+        redirectOrigin: 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/',
+      }),
+    });
+    const startedText = await started.text();
+    assert.equal(started.status, 200, startedText);
+    assert.equal(startedText.includes(deviceCode), false);
+    assert.deepEqual(JSON.parse(startedText), {
+      status: 'device',
+      apiUrl: 'https://vectoree.ai',
+      userCode: 'ABCD-EFGH',
+      verificationUri: 'https://vectoree.ai/cli/device?user_code=ABCD-EFGH',
+      intervalSeconds: 1,
+    });
+
+    const waiting = await app.request('/api/setup/device', { method: 'POST' });
+    const waitingText = await waiting.text();
+    assert.equal(waiting.status, 200, waitingText);
+    assert.equal(JSON.parse(waitingText).status, 'device');
+    assert.equal(waitingText.includes(deviceCode), false);
+
+    const approved = await app.request('/api/setup/device', { method: 'POST' });
+    const approvedText = await approved.text();
+    assert.equal(approved.status, 200, approvedText);
+    assert.equal(JSON.parse(approvedText).status, 'authorized');
+    assert.equal(approvedText.includes(access), false);
+    assert.equal(approvedText.includes(deviceCode), false);
+
+    const listed = await app.request('/api/setup/projects');
+    assert.equal(listed.status, 200);
+    const again = await app.request('/api/setup/device', { method: 'POST' });
+    assert.equal(again.status, 409);
+  });
+
+  it('still rejects a hosted name that is not a Vectoree site', async () => {
+    const app = createApp({ root: tempRoot(), env: {} });
+    const res = await app.request('/api/setup/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ openBrowser: false, redirectOrigin: 'https://evil.example/starter/' }),
+    });
+    const body = (await res.json()) as { message?: string };
+    assert.equal(res.status, 400);
+    assert.match(body.message ?? '', /127\.0\.0\.1:5173/);
+  });
+
   it('defaults the callback to the loopback app origin', async () => {
     let opened = '';
     const app = createApp({
@@ -2191,6 +2275,7 @@ describe('cloud preview', () => {
       ['POST', '/api/setup/connect'],
       ['GET', '/api/setup/callback?code=x&state=y'],
       ['POST', '/api/setup/token'],
+      ['POST', '/api/setup/device'],
       ['GET', '/api/setup/projects'],
       ['POST', '/api/setup/link'],
       ['GET', '/api/settings'],

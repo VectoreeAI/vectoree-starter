@@ -11,8 +11,11 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 const KEY_SCOPES = ['gateway:chat', 'gateway:models', 'tools:*', 'database:*', 'storage:*', 'auth:*'];
 
 export type ConnectPublic = {
-  status: 'idle' | 'pending' | 'callback' | 'authorized' | 'linked' | 'error';
+  status: 'idle' | 'pending' | 'device' | 'callback' | 'authorized' | 'linked' | 'error';
   authorizeUrl?: string;
+  userCode?: string;
+  verificationUri?: string;
+  intervalSeconds?: number;
   message?: string;
   apiUrl?: string;
   projectId?: string;
@@ -39,6 +42,15 @@ type PendingLogin = {
   code?: string;
 };
 
+type PendingDevice = {
+  deviceCode: string;
+  apiUrl: string;
+  userCode: string;
+  verificationUri: string;
+  intervalSeconds: number;
+  expiresAt: number;
+};
+
 type ConsoleSession = { apiUrl: string; accessToken: string; refreshToken?: string };
 
 export function createConsoleLinker(options: ConsoleLinkerOptions) {
@@ -47,9 +59,11 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
   const timeoutMs = options.timeoutMs ?? 180_000;
   let state: ConnectPublic = { status: 'idle' };
   let login: PendingLogin | null = null;
+  let device: PendingDevice | null = null;
   let session: ConsoleSession | null = null;
   let projects: ConsoleProject[] = [];
   let exchanging: Promise<ConnectPublic> | null = null;
+  let polling: Promise<ConnectPublic> | null = null;
   let linking: Promise<ConnectPublic> | null = null;
 
   return {
@@ -58,12 +72,18 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
         login = null;
         state = { status: 'error', apiUrl: state.apiUrl, message: 'Console login timed out. Log in again.' };
       }
-      return { ...state };
+      if (state.status === 'device' && device && Date.now() > device.expiresAt) {
+        device = null;
+        state = { status: 'error', apiUrl: state.apiUrl, message: 'Console login timed out. Log in again.' };
+      }
+      return publicConnect(state);
     },
 
     async start(input: { apiUrl?: string; openBrowser?: boolean; redirectOrigin?: string }): Promise<ConnectPublic> {
       const apiUrl = normalizeApiUrl(input.apiUrl?.trim() || 'https://vectoree.ai');
+      if (isHostedConsoleOrigin(input.redirectOrigin)) return startDevice(apiUrl);
       const redirectUri = callbackUriFromOrigin(input.redirectOrigin) ?? 'http://127.0.0.1:5173/api/setup/callback';
+      device = null;
       const { verifier, challenge } = pkcePair();
       const stateValue = randomBytes(16).toString('hex');
       login = {
@@ -111,6 +131,56 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       current.code = query.code;
       state = { status: 'callback', apiUrl: current.apiUrl };
       return { status: 302, location: current.appUrl };
+    },
+
+    pollDevice(): Promise<ConnectPublic> {
+      if (polling) return polling;
+      const current = device;
+      if (!current || state.status !== 'device') {
+        return Promise.reject(new ConfigError('No Console login to finish. Log in again.', 409));
+      }
+      if (Date.now() > current.expiresAt) {
+        device = null;
+        state = { status: 'error', apiUrl: current.apiUrl, message: 'Console login timed out. Log in again.' };
+        return Promise.resolve(publicConnect(state));
+      }
+      polling = (async () => {
+        try {
+          const response = await fetchImpl(`${current.apiUrl}/api/system/auth/cli/device/token`, {
+            method: 'POST',
+            headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_code: current.deviceCode }),
+          });
+          const data = await readBody(response);
+          const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+          const errorCode = text(record.error);
+          if (response.status === 400 && (errorCode === 'authorization_pending' || errorCode === 'slow_down')) {
+            return publicConnect(state);
+          }
+          if (!response.ok || typeof record.accessToken !== 'string' || !record.accessToken) {
+            device = null;
+            const message = !response.ok
+              ? text(record.error_description) || readErrorMessage(data, `Console login failed (${response.status})`)
+              : 'Console login did not return a session';
+            state = { status: 'error', apiUrl: current.apiUrl, message };
+            throw new ConfigError(message, 502);
+          }
+          session = {
+            apiUrl: current.apiUrl,
+            accessToken: record.accessToken,
+            refreshToken: typeof record.refreshToken === 'string' ? record.refreshToken : undefined,
+          };
+          device = null;
+          state = { status: 'authorized', apiUrl: current.apiUrl };
+          return publicConnect(state);
+        } catch (error) {
+          if (error instanceof ConfigError) throw error;
+          throw new ConfigError(error instanceof Error ? error.message : 'Console login failed', 502);
+        } finally {
+          polling = null;
+        }
+      })();
+      return polling;
     },
 
     exchange(): Promise<ConnectPublic> {
@@ -220,6 +290,49 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
     },
   };
 
+  async function startDevice(apiUrl: string): Promise<ConnectPublic> {
+    login = null;
+    session = null;
+    projects = [];
+    let response: Response;
+    try {
+      response = await fetchImpl(`${apiUrl}/api/system/auth/cli/device/code`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'network error';
+      const message = `Could not reach Vectoree at ${apiUrl} (${reason})`;
+      device = null;
+      state = { status: 'error', apiUrl, message };
+      throw new ConfigError(message, 502);
+    }
+    const data = await readBody(response);
+    const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+    const deviceCode = text(record.device_code);
+    const userCode = text(record.user_code);
+    const verificationUri = text(record.verification_uri_complete) || text(record.verification_uri);
+    if (!response.ok || !deviceCode || !userCode || !verificationUri) {
+      device = null;
+      const message = readErrorMessage(data, 'Console login did not return a device code');
+      state = { status: 'error', apiUrl, message };
+      throw new ConfigError(message, 502);
+    }
+    const expiresIn = typeof record.expires_in === 'number' && record.expires_in > 0 ? record.expires_in : 900;
+    const intervalSeconds = typeof record.interval === 'number' && record.interval >= 1 ? Math.ceil(record.interval) : 2;
+    device = {
+      deviceCode,
+      apiUrl,
+      userCode,
+      verificationUri,
+      intervalSeconds,
+      expiresAt: Date.now() + expiresIn * 1000,
+    };
+    state = { status: 'device', apiUrl, userCode, verificationUri, intervalSeconds };
+    return publicConnect(state);
+  }
+
   function requireSession(): ConsoleSession {
     if (!session || state.status !== 'authorized') {
       throw new ConfigError('Log in to Vectoree first', 401);
@@ -232,6 +345,27 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
     projects = [];
     state = { status: 'error', apiUrl: state.apiUrl, message };
   }
+}
+
+const HOSTED_CONSOLE_HOSTS = new Set(['vectoree.ai', 'www.vectoree.ai', 'vectoree.net', 'www.vectoree.net']);
+
+function publicConnect(state: ConnectPublic): ConnectPublic {
+  return { ...state };
+}
+
+export function isHostedConsoleOrigin(origin: string | undefined): boolean {
+  const trimmed = origin?.trim();
+  if (!trimmed) return false;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:') return false;
+  if (url.port !== '' && url.port !== '443') return false;
+  const host = url.hostname.toLowerCase();
+  return host === 'vectoree.site' || host.endsWith('.vectoree.site') || HOSTED_CONSOLE_HOSTS.has(host);
 }
 
 function appUrlFromCallback(callbackUri: string): string {

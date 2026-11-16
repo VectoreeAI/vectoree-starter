@@ -1416,6 +1416,18 @@ textarea.field {
   padding: 22px;
 }
 
+.device-code {
+  display: inline-block;
+  margin: 0;
+  padding: 12px 18px;
+  background: var(--acid);
+  border: 2px solid var(--ink);
+  box-shadow: var(--shadow);
+  font-family: var(--font-mono);
+  font-size: 28px;
+  letter-spacing: 0.12em;
+}
+
 .link-count {
   width: 96px;
   height: 96px;
