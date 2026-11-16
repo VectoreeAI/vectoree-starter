@@ -78,6 +78,13 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
   const [userCode, setUserCode] = useState('');
   const [verificationUri, setVerificationUri] = useState('');
   const [intervalSeconds, setIntervalSeconds] = useState(2);
+  function explain(message: string | undefined, fallback: string): string {
+    if (message === 'Log in to Vectoree first') return t('loginFirst');
+    if (message === 'Console login timed out. Log in again.') return t('loginTimeout');
+    if (message === 'No Console login to finish. Log in again.') return t('loginAgain');
+    return message || fallback;
+  }
+
   const resumed = useRef(false);
   const onLinkedRef = useRef(onLinked);
   onLinkedRef.current = onLinked;
@@ -94,7 +101,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
         }
         if (status.status === 'callback') return signIn();
         if (status.status === 'authorized') return fetchProjects();
-        if (status.status === 'error') setError(status.message || t('loginFail'));
+        if (status.status === 'error') setError(explain(status.message, t('loginFail')));
         setPhase('login');
       })
       .catch((err: unknown) => {
@@ -122,7 +129,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
     try {
       await exchangeConsoleCode();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('loginFail'));
+      setError(explain(err instanceof Error ? err.message : undefined, t('loginFail')));
       setPhase('login');
       return;
     }
@@ -140,7 +147,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
       );
       setPhase('choose');
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('listProjectsFail'));
+      setError(explain(err instanceof Error ? err.message : undefined, t('listProjectsFail')));
       setPhase('login');
     }
   }
@@ -166,7 +173,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
           return;
         }
         if (status.status === 'error') {
-          setError(status.message || t('loginFail'));
+          setError(explain(status.message, t('loginFail')));
           setPhase('login');
           return;
         }
@@ -174,7 +181,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
         if (status.userCode) setUserCode(status.userCode);
         if (status.verificationUri) setVerificationUri(status.verificationUri);
       } catch (err) {
-        if (!stopped) setError(err instanceof Error ? err.message : t('loginFail'));
+        if (!stopped) setError(explain(err instanceof Error ? err.message : undefined, t('loginFail')));
       }
       if (!stopped) timer = window.setTimeout(() => void tick(), wait);
     };
@@ -201,7 +208,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
       if (!status.authorizeUrl) throw new Error(status.message || t('loginFail'));
       window.location.assign(status.authorizeUrl);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('loginFail'));
+      setError(explain(err instanceof Error ? err.message : undefined, t('loginFail')));
       setPhase('login');
     }
   }
