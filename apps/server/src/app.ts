@@ -217,7 +217,7 @@ export function createApp(deps: AppDeps): Hono {
     const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
     const projectId = typeof record.projectId === 'string' ? record.projectId : '';
     const turnstileToken = typeof record.turnstileToken === 'string' ? record.turnstileToken : undefined;
-    return c.json(await linker.link(projectId, turnstileToken));
+    return c.json(await linker.link(projectId, turnstileToken, record.hostedRelay === true));
   });
 
   app.get('/api/auth/session', (c) => c.json({ user: readSession(c)?.user ?? null }));
