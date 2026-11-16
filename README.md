@@ -30,12 +30,13 @@ Requirements: Docker with Compose. This does not replace the host link step.
 docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 ```
 
-- Web: http://localhost:5173
-- BFF inside the compose network: `server:8787` (not published on the host)
+- App: http://localhost:5173/starter/
 
-`docker-compose.yml` is the file Vectoree hosting reads when you import this repo from Git or a zip. It must pass the platform compose policy, so it publishes no ports, reads no host files, and sets no `container_name`. The host port, `.env`, and the `./.vectoree` bind mount live in `docker-compose.local.yml`, which only your local `docker compose` reads. Plain `docker compose up` still builds and starts both services, but nothing is published on the host and the project link is kept in the `starter-data` volume instead of `./.vectoree`.
+Compose runs one container, built from the `app` stage of the `Dockerfile`. The BFF serves the built page under `/starter/` and the API under `/starter/api` on port 5173 (`WEB_DIST` points it at `apps/web/dist`). There is no second service. Vectoree hosting attaches every service to a shared network, so a web container that looked up `server` by name could reach another app's BFF and lose the Console login between requests.
 
-Compose sets `HOST=0.0.0.0` so the BFF accepts traffic from the web container. Local `npm run dev` still binds `127.0.0.1`. The web container proxies `/api` to `http://server:8787` (`API_PROXY`). The browser stays on port 5173, so the session cookie stays same-origin.
+`docker-compose.yml` is the file Vectoree hosting reads when you import this repo from Git or a zip. It must pass the platform compose policy, so it publishes no ports, reads no host files, and sets no `container_name`. The host port, `.env`, and the `./.vectoree` bind mount live in `docker-compose.local.yml`, which only your local `docker compose` reads. Plain `docker compose up` still builds and starts the container, but nothing is published on the host and the project link is kept in the `starter-data` volume instead of `./.vectoree`.
+
+Compose sets `HOST=0.0.0.0` so the container accepts traffic from outside. Local `npm run dev` still binds `127.0.0.1` and keeps the Vite proxy. The container runs as the `node` user. A `starter-data` volume created by the earlier two-service layout holds files owned by root, so it cannot be reused; let the new deploy create a fresh volume. The `server` and `web` stages stay in the `Dockerfile` for `docker-compose.deploy.yml`.
 
 Volume: `./.vectoree` → `/app/.vectoree` (project link). Chat history is stored in the connected project's database. Compose does not mount `.env`; it passes it to the BFF as an optional `env_file`, so variables set there reach the container and a missing file is fine.
 
@@ -53,7 +54,7 @@ On the Vectoree side, set `STARTER_PREVIEW_BASE_URL` to this app's URL (for exam
 
 Previews live in BFF memory. Restarting the server drops them, and visitors see **Preview expired** until they click Preview in Vectoree again.
 
-**Connect through a forwarded port:** open the app at `http://127.0.0.1:5173/starter/` (or `http://localhost:5173/starter/`). Click **登录 Vectoree**. After Console login, the browser returns to `http://127.0.0.1:5173/starter/api/setup/callback` on that same forwarded port, which redirects back into the app. The web server proxies it to the BFF. You can also mount a `.vectoree/config.json` written elsewhere. If a previous `docker compose up` already created a directory named `.env`, remove that directory before relying on a real env file.
+**Connect through a forwarded port:** open the app at `http://127.0.0.1:5173/starter/` (or `http://localhost:5173/starter/`). Click **登录 Vectoree**. After Console login, the browser returns to `http://127.0.0.1:5173/starter/api/setup/callback` on that same forwarded port, which redirects back into the app. The same process that serves the page handles it. You can also mount a `.vectoree/config.json` written elsewhere. If a previous `docker compose up` already created a directory named `.env`, remove that directory before relying on a real env file.
 
 **Connect on a hosted name:** open `https://rt-<app-id>.vectoree.site/starter/`, `https://vectoree.ai/starter/`, or `https://vectoree.net/starter/`. Click **登录 Vectoree**. This tab opens the Vectoree login page. After you sign in, Vectoree asks you to allow this starter, then sends the login code back to `…/starter/api/setup/callback`. The page then lists your projects.
 
@@ -112,4 +113,4 @@ Restarting the BFF clears in-memory sessions. Sign in again.
 | `npm run dev` | Web + BFF |
 | `npm run typecheck` | Typecheck both workspaces |
 | `npm test` | BFF unit tests (no network) |
-| `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build` | Web + BFF in containers |
+| `docker compose -f docker-compose.yml -f docker-compose.local.yml up --build` | Web + BFF in one container |
