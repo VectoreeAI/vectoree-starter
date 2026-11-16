@@ -82,6 +82,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
     if (message === 'Log in to Vectoree first') return t('loginFirst');
     if (message === 'Console login timed out. Log in again.') return t('loginTimeout');
     if (message === 'No Console login to finish. Log in again.') return t('loginAgain');
+    if (message?.includes('Connect from the forwarded address')) return t('loginOrigin');
     return message || fallback;
   }
 

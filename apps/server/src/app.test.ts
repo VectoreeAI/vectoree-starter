@@ -499,7 +499,7 @@ describe('console connect', () => {
     assert.equal(callback.status, 302);
     assert.equal(callback.headers.get('location'), 'http://127.0.0.1:5173/starter/');
     const returned = (await (await app.request('/api/setup/connect')).json()) as { status: string };
-    assert.equal(returned.status, 'callback');
+    assert.equal(returned.status, 'authorized');
 
     const token = await app.request('/api/setup/token', { method: 'POST' });
     const tokenText = await token.text();
@@ -616,11 +616,14 @@ describe('console connect', () => {
     const app = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
     const { state } = await startLogin(app);
     const res = await app.request('/api/setup/callback?code=auth-code&state=nope');
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get('location'), 'http://127.0.0.1:5173/');
     const saved = JSON.parse(fs.readFileSync(path.join(root, '.vectoree', 'console-login.json'), 'utf8')) as {
       state: string;
+      code?: string;
     };
     assert.equal(saved.state, state);
+    assert.equal(saved.code, undefined);
   });
 
   it('opens the same callback again and finishes it from the stored login', async () => {
@@ -633,31 +636,28 @@ describe('console connect', () => {
     assert.equal(fs.statSync(loginFile).mode & 0o777, 0o600);
     const callbackUrl = `/api/setup/callback?code=auth-code&state=${state}`;
     const first = await app.request(callbackUrl);
-    const second = await app.request(callbackUrl);
+    const firstBody = await first.text();
     assert.equal(first.status, 302);
-    assert.equal(second.status, 302);
-    assert.equal(second.headers.get('location'), 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/');
-    const replayBody = await second.text();
-    assert.equal(replayBody.includes(stored.verifier), false);
-    assert.equal(replayBody.includes('auth-code'), false);
-    const kept = JSON.parse(fs.readFileSync(loginFile, 'utf8')) as { code?: string; verifier: string };
-    assert.equal(kept.code, 'auth-code');
+    assert.equal(first.headers.get('location'), origin);
+    assert.equal(firstBody.includes(stored.verifier), false);
+    assert.equal(firstBody.includes('auth-code'), false);
+    assert.equal(fs.existsSync(loginFile), false);
+    const statusText = await (await app.request('/api/setup/connect')).text();
+    assert.equal(JSON.parse(statusText).status, 'authorized');
+    assert.equal(statusText.includes(stored.verifier), false);
+    assert.equal(statusText.includes(access), false);
 
+    const second = await app.request(callbackUrl);
+    assert.equal(second.status, 302);
+    assert.equal(second.headers.get('location'), origin);
     const restarted = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
     const again = await restarted.request(callbackUrl);
     assert.equal(again.status, 302);
-    const statusText = await (await restarted.request('/api/setup/connect')).text();
-    assert.equal(JSON.parse(statusText).status, 'callback');
-    assert.equal(statusText.includes(stored.verifier), false);
-    assert.equal(statusText.includes('auth-code'), false);
-    const token = await restarted.request('/api/setup/token', { method: 'POST' });
-    assert.equal(token.status, 200);
-    assert.equal(fs.existsSync(loginFile), false);
-    const resumed = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
-    const resumedStatus = await (await resumed.request('/api/setup/connect')).text();
+    assert.equal(again.headers.get('location'), origin);
+    const resumedStatus = await (await restarted.request('/api/setup/connect')).text();
     assert.equal(JSON.parse(resumedStatus).status, 'authorized');
     assert.equal(resumedStatus.includes(access), false);
-    const listed = await resumed.request('/api/setup/projects');
+    const listed = await restarted.request('/api/setup/projects');
     assert.equal(listed.status, 200);
   });
 
@@ -673,13 +673,12 @@ describe('console connect', () => {
     }) as typeof fetch;
     const app = createApp({ root, env: {}, fetchImpl });
     const first = await startLogin(app);
-    await app.request(`/api/setup/callback?code=auth-code&state=${first.state}`);
-    const exchanging = app.request('/api/setup/token', { method: 'POST' });
+    const exchanging = app.request(`/api/setup/callback?code=auth-code&state=${first.state}`);
     await new Promise((resolve) => setTimeout(resolve, 30));
     const second = await startLogin(app);
     release();
     const done = await exchanging;
-    assert.equal(done.status, 200);
+    assert.equal(done.status, 302);
     const saved = JSON.parse(fs.readFileSync(path.join(root, '.vectoree', 'console-login.json'), 'utf8')) as {
       state: string;
     };
@@ -771,6 +770,24 @@ describe('console connect', () => {
     assert.equal(turnstileHeader, 'cf-token');
     assert.equal(relayHeader, 'hosted');
     assert.equal(fs.existsSync(sessionFile), false);
+  });
+
+  it('uses https for a hosted page that was opened with http', async () => {
+    const root = tempRoot();
+    const app = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
+    const { authorize, state } = await startLogin(
+      app,
+      'http://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/',
+    );
+    assert.equal(
+      authorize.searchParams.get('redirect_uri'),
+      'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/api/setup/callback',
+    );
+    const callback = await app.request(`/api/setup/callback?code=auth-code&state=${state}`);
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get('location'), 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/');
+    const snap = (await (await app.request('/api/setup/connect')).json()) as { status: string };
+    assert.equal(snap.status, 'authorized');
   });
 
   it('still rejects a hosted name that is not a Vectoree site', async () => {
