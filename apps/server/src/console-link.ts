@@ -354,49 +354,6 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
     },
   };
 
-  async function startDevice(apiUrl: string): Promise<ConnectPublic> {
-    login = null;
-    forgetSession();
-    projects = [];
-    let response: Response;
-    try {
-      response = await fetchImpl(`${apiUrl}/api/system/auth/cli/device/code`, {
-        method: 'POST',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : 'network error';
-      const message = `Could not reach Vectoree at ${apiUrl} (${reason})`;
-      device = null;
-      state = { status: 'error', apiUrl, message };
-      throw new ConfigError(message, 502);
-    }
-    const data = await readBody(response);
-    const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
-    const deviceCode = text(record.device_code);
-    const userCode = text(record.user_code);
-    const verificationUri = text(record.verification_uri_complete) || text(record.verification_uri);
-    if (!response.ok || !deviceCode || !userCode || !verificationUri) {
-      device = null;
-      const message = readErrorMessage(data, 'Console login did not return a device code');
-      state = { status: 'error', apiUrl, message };
-      throw new ConfigError(message, 502);
-    }
-    const expiresIn = typeof record.expires_in === 'number' && record.expires_in > 0 ? record.expires_in : 900;
-    const intervalSeconds = typeof record.interval === 'number' && record.interval >= 1 ? Math.ceil(record.interval) : 2;
-    device = {
-      deviceCode,
-      apiUrl,
-      userCode,
-      verificationUri,
-      intervalSeconds,
-      expiresAt: Date.now() + expiresIn * 1000,
-    };
-    state = { status: 'device', apiUrl, userCode, verificationUri, intervalSeconds };
-    return publicConnect(state);
-  }
-
   function rememberSession(next: ConsoleSession) {
     session = next;
     writeConsoleSession(options.root, next);
