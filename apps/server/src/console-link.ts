@@ -297,7 +297,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       return { siteKey: siteKey || null };
     },
 
-    link(projectId: string, turnstileToken?: string): Promise<ConnectPublic> {
+    link(projectId: string, turnstileToken?: string, hostedRelay = false): Promise<ConnectPublic> {
       if (linking) return linking;
       const id = projectId.trim();
       if (!PROJECT_UUID.test(id)) {
@@ -322,6 +322,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
             projectName: match.name,
             root: options.root,
             turnstileToken,
+            hostedRelay,
           });
           writeLinkedConfig(
             options.root,
@@ -534,7 +535,7 @@ async function mintProjectKey(
   fetchImpl: typeof fetch,
   apiUrl: string,
   accessToken: string,
-  input: { projectId: string; projectName: string; root: string; turnstileToken?: string },
+  input: { projectId: string; projectName: string; root: string; turnstileToken?: string; hostedRelay?: boolean },
 ): Promise<{ apiKey: string; keyId?: string }> {
   const token = input.turnstileToken?.trim();
   const response = await fetchImpl(`${apiUrl}/api/gateway/keys`, {
@@ -546,6 +547,7 @@ async function mintProjectKey(
       'X-Project-Id': input.projectId,
       'User-Agent': 'VectoreeCLI',
       ...(token ? { 'X-Turnstile-Token': token } : {}),
+      ...(input.hostedRelay ? { 'X-Vectoree-Link-Relay': 'hosted' } : {}),
     },
     body: JSON.stringify({
       name: `CLI — ${os.hostname()}`.slice(0, 128),

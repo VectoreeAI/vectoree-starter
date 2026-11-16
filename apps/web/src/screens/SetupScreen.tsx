@@ -31,6 +31,14 @@ type Phase = 'checking' | 'login' | 'redirecting' | 'device' | 'signingIn' | 'fe
 
 type LinkCheckMessage = { type?: string; token?: string; skipped?: boolean; error?: string };
 
+const HOSTED_LINK_HOSTS = new Set(['vectoree.ai', 'www.vectoree.ai', 'vectoree.net', 'www.vectoree.net', 'vectoree.site']);
+const RUNTIME_SITE_HOST = /^rt-[0-9a-f]{32}\.vectoree\.site$/;
+
+function isHostedLinkPage(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return HOSTED_LINK_HOSTS.has(host) || RUNTIME_SITE_HOST.test(host);
+}
+
 function waitForLinkCheck(popup: Window, fail: (message: string) => Error): Promise<string | undefined> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -215,7 +223,7 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
         if (kind === 'closed') return new Error(t('linkCheckClosed'));
         return new Error(kind === 'fail' ? t('linkCheckFail') : kind);
       });
-      const status = await linkProject(selected, token);
+      const status = await linkProject(selected, token, isHostedLinkPage(window.location.hostname));
       const project = projects.find((item) => item.id === selected);
       const name = status.projectName || project?.name || selected;
       setLinkedName(project?.organizationName ? `${project.organizationName} / ${name}` : name);

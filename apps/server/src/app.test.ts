@@ -452,6 +452,7 @@ describe('console connect', () => {
         assert.equal(headers.get('authorization'), `Bearer ${access}`);
         assert.equal(headers.get('x-project-id'), projectId);
         assert.equal(headers.get('user-agent'), 'VectoreeCLI');
+        assert.equal(headers.get('x-vectoree-link-relay'), null);
         assert.equal(body.projectId, projectId);
         assert.match(body.name ?? '', /^CLI — /);
         assert.ok((body.deviceId ?? '').length >= 8);
@@ -654,13 +655,18 @@ describe('console connect', () => {
   it('uses PKCE on a hosted origin and forwards the human-check token', async () => {
     const root = tempRoot();
     let turnstileHeader: string | null = null;
+    let relayHeader: string | null = null;
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/api/system/auth/public-config')) {
         return Response.json({ turnstileSiteKey: 'site-key' });
       }
       if (url.includes('/api/gateway/keys')) {
-        turnstileHeader = new Headers(init?.headers).get('x-turnstile-token');
+        const headers = new Headers(init?.headers);
+        turnstileHeader = headers.get('x-turnstile-token');
+        relayHeader = headers.get('x-vectoree-link-relay');
+        headers.delete('x-vectoree-link-relay');
+        return consoleFetch(root)(input, { ...init, headers });
       }
       return consoleFetch(root)(input, init);
     }) as typeof fetch;
@@ -687,7 +693,7 @@ describe('console connect', () => {
     const linked = await restarted.request('/api/setup/link', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId, turnstileToken: 'cf-token' }),
+      body: JSON.stringify({ projectId, turnstileToken: 'cf-token', hostedRelay: true }),
     });
     const linkedText = await linked.text();
     assert.equal(linked.status, 200, linkedText);
@@ -695,6 +701,7 @@ describe('console connect', () => {
     assert.equal(linkedText.includes(access), false);
     assert.equal(linkedText.includes('cf-token'), false);
     assert.equal(turnstileHeader, 'cf-token');
+    assert.equal(relayHeader, 'hosted');
     assert.equal(fs.existsSync(sessionFile), false);
   });
 
