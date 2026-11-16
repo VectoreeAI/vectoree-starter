@@ -97,10 +97,70 @@ function clearConsoleSession(root: string): void {
   }
 }
 
+function consoleLoginFile(root: string): string {
+  return path.join(root, '.vectoree', 'console-login.json');
+}
+
+function writePendingLogin(root: string, pending: PendingLogin): void {
+  const dir = path.join(root, '.vectoree');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = consoleLoginFile(root);
+  const tmp = path.join(dir, `.console-login.json.${process.pid}.tmp`);
+  const body = {
+    state: pending.state,
+    verifier: pending.verifier,
+    apiUrl: pending.apiUrl,
+    redirectUri: pending.redirectUri,
+    appUrl: pending.appUrl,
+    expiresAt: pending.expiresAt,
+    ...(pending.code ? { code: pending.code } : {}),
+  };
+  fs.writeFileSync(tmp, `${JSON.stringify(body)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // chmod can fail on some filesystems; the file is still written.
+  }
+}
+
+function readPendingLogin(root: string): PendingLogin | null {
+  try {
+    const record = JSON.parse(fs.readFileSync(consoleLoginFile(root), 'utf8')) as Record<string, unknown>;
+    const stateValue = text(record.state);
+    const verifier = text(record.verifier);
+    const apiUrl = text(record.apiUrl);
+    const redirectUri = text(record.redirectUri);
+    const appUrl = text(record.appUrl);
+    const expiresAt = typeof record.expiresAt === 'number' ? record.expiresAt : 0;
+    if (!stateValue || !verifier || !apiUrl || !redirectUri || !appUrl || !expiresAt) return null;
+    const code = text(record.code);
+    return {
+      state: stateValue,
+      verifier,
+      apiUrl,
+      redirectUri,
+      appUrl,
+      expiresAt,
+      ...(code ? { code } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingLogin(root: string): void {
+  try {
+    fs.rmSync(consoleLoginFile(root), { force: true });
+  } catch {
+    // A missing pending login is already the state we want.
+  }
+}
+
 export function createConsoleLinker(options: ConsoleLinkerOptions) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const openUrl = options.openUrl ?? openSystemBrowser;
-  const timeoutMs = options.timeoutMs ?? 180_000;
+  const timeoutMs = options.timeoutMs ?? 600_000;
   let state: ConnectPublic = { status: 'idle' };
   let login: PendingLogin | null = null;
   let device: PendingDevice | null = null;
@@ -112,13 +172,22 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
 
   return {
     snapshot(): ConnectPublic {
-      if (state.status === 'pending' && login && Date.now() > login.expiresAt) {
+      const pending = syncLogin();
+      if (pending && !pending.code && Date.now() > pending.expiresAt) {
+        clearPendingLogin(options.root);
         login = null;
-        state = { status: 'error', apiUrl: state.apiUrl, message: 'Console login timed out. Log in again.' };
-      }
-      if (state.status === 'device' && device && Date.now() > device.expiresAt) {
+        state = { status: 'error', apiUrl: pending.apiUrl, message: 'Console login timed out. Log in again.' };
+      } else if (pending?.code) {
+        state = { status: 'callback', apiUrl: pending.apiUrl };
+      } else if (pending) {
+        if (state.status !== 'pending') state = { status: 'pending', apiUrl: pending.apiUrl };
+      } else if (state.status === 'device' && device && Date.now() > device.expiresAt) {
         device = null;
         state = { status: 'error', apiUrl: state.apiUrl, message: 'Console login timed out. Log in again.' };
+      } else if (state.status !== 'linked' && state.status !== 'error' && state.status !== 'device') {
+        loadSession();
+        if (session) state = { status: 'authorized', apiUrl: session.apiUrl };
+        else if (state.status === 'authorized' || state.status === 'callback') state = { status: 'idle' };
       }
       return publicConnect(state);
     },
@@ -130,7 +199,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       forgetSession();
       const { verifier, challenge } = pkcePair();
       const stateValue = randomBytes(16).toString('hex');
-      login = {
+      const pendingLogin: PendingLogin = {
         state: stateValue,
         verifier,
         apiUrl,
@@ -138,6 +207,8 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
         appUrl: appUrlFromCallback(redirectUri),
         expiresAt: Date.now() + timeoutMs,
       };
+      login = pendingLogin;
+      writePendingLogin(options.root, pendingLogin);
       projects = [];
       const authorize = new URL(`${apiUrl}/api/system/auth/cli/authorize`);
       authorize.searchParams.set('response_type', 'code');
@@ -157,11 +228,19 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       error?: string;
       errorDescription?: string;
     }): { status: 302; location: string } | { status: 400; html: string } {
-      const current = login;
-      if (!current || query.state !== current.state || current.code) {
+      const current = syncLogin();
+      if (!current || query.state !== current.state) {
+        return { status: 400, html: '<p>Invalid Vectoree login callback.</p>' };
+      }
+      if (current.code) {
+        if (query.code === current.code) {
+          state = { status: 'callback', apiUrl: current.apiUrl };
+          return { status: 302, location: current.appUrl };
+        }
         return { status: 400, html: '<p>Invalid Vectoree login callback.</p>' };
       }
       if (query.error || !query.code || Date.now() > current.expiresAt) {
+        clearPendingLogin(options.root);
         login = null;
         const message = query.error
           ? query.errorDescription || `Console login failed (${query.error})`
@@ -171,7 +250,9 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
         state = { status: 'error', apiUrl: current.apiUrl, message };
         return { status: 302, location: current.appUrl };
       }
-      current.code = query.code;
+      const received: PendingLogin = { ...current, code: query.code };
+      login = received;
+      writePendingLogin(options.root, received);
       state = { status: 'callback', apiUrl: current.apiUrl };
       return { status: 302, location: current.appUrl };
     },
@@ -228,31 +309,51 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
 
     exchange(): Promise<ConnectPublic> {
       if (exchanging) return exchanging;
-      if (state.status === 'authorized' && session) return Promise.resolve({ ...state });
-      const current = login;
+      loadSession();
+      const current = syncLogin();
+      if (session) {
+        if (current) {
+          clearPendingLogin(options.root);
+          login = null;
+        }
+        state = { status: 'authorized', apiUrl: session.apiUrl };
+        return Promise.resolve({ ...state });
+      }
       if (!current?.code) {
         return Promise.reject(new ConfigError('No Console login to finish. Log in again.', 409));
       }
       const code = current.code;
       exchanging = (async () => {
         try {
-          rememberSession({
-            apiUrl: current.apiUrl,
-            ...(await exchangeCode(fetchImpl, current.apiUrl, {
-              code,
-              codeVerifier: current.verifier,
-              redirectUri: current.redirectUri,
-            })),
+          const tokens = await exchangeCode(fetchImpl, current.apiUrl, {
+            code,
+            codeVerifier: current.verifier,
+            redirectUri: current.redirectUri,
           });
+          const latest = readPendingLogin(options.root);
+          if (latest && latest.state !== current.state) return publicConnect(state);
+          rememberSession({ apiUrl: current.apiUrl, ...tokens });
           state = { status: 'authorized', apiUrl: current.apiUrl };
           return { ...state };
         } catch (error) {
+          const latest = readPendingLogin(options.root);
+          if (latest && latest.state !== current.state) {
+            throw error instanceof ConfigError
+              ? error
+              : new ConfigError(error instanceof Error ? error.message : 'Console login failed', 502);
+          }
           forgetSession();
           const message = error instanceof Error ? error.message : 'Console login failed';
           state = { status: 'error', apiUrl: current.apiUrl, message };
           throw new ConfigError(message, 502);
         } finally {
-          if (login === current) login = null;
+          const latest = readPendingLogin(options.root);
+          if (!latest || latest.state === current.state) {
+            clearPendingLogin(options.root);
+            login = null;
+          } else {
+            login = latest;
+          }
           exchanging = null;
         }
       })();
@@ -355,6 +456,18 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
     },
   };
 
+  function syncLogin(): PendingLogin | null {
+    login = readPendingLogin(options.root);
+    return login;
+  }
+
+  function loadSession() {
+    if (!session) {
+      const stored = readConsoleSession(options.root);
+      if (stored) session = stored;
+    }
+  }
+
   function rememberSession(next: ConsoleSession) {
     session = next;
     writeConsoleSession(options.root, next);
@@ -366,10 +479,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
   }
 
   function requireSession(): ConsoleSession {
-    if (!session) {
-      const stored = readConsoleSession(options.root);
-      if (stored) session = stored;
-    }
+    loadSession();
     if (!session) throw new ConfigError('Log in to Vectoree first', 401);
     if (state.status !== 'authorized') state = { status: 'authorized', apiUrl: session.apiUrl };
     return session;
