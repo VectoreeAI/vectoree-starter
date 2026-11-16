@@ -23,3 +23,15 @@ RUN mkdir -p node_modules/.vite-temp && chown node:node node_modules/.vite-temp
 USER node
 EXPOSE 5173
 CMD ["npm", "run", "preview", "-w", "@vectoree-starter/web", "--", "--host", "0.0.0.0", "--port", "5173", "--strictPort"]
+
+# Page and BFF in one container. Vectoree hosting puts every service on a shared
+# network, where a service name such as `server` can resolve to another app.
+FROM build AS app
+ENV HOST=0.0.0.0
+ENV PORT=5173
+ENV WEB_DIST=/app/apps/web/dist
+# The BFF writes .env and .vectoree/ under /app; a new starter-data volume copies this owner.
+RUN mkdir -p .vectoree && chown node:node /app .vectoree
+USER node
+EXPOSE 5173
+CMD ["npm", "run", "start", "-w", "@vectoree-starter/server"]

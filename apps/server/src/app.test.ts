@@ -11,6 +11,7 @@ import { loadEnvFiles, normalizeApiUrl, publicSetupStatus, writeLinkedConfig, wr
 import { createImageToolResponse, normalizeGeneratedImages } from './image-tool.js';
 import { clearPreviews, PREVIEW_COOKIE, PREVIEW_IDLE_MS, seedPreview } from './preview.js';
 import { clearSessions, seedSession, SESSION_COOKIE } from './session.js';
+import { withWeb } from './web.js';
 
 const secret = 'sk-ve-v1-test-secret-do-not-leak';
 const dirs: string[] = [];
@@ -2713,5 +2714,66 @@ describe('preview auth', () => {
     });
     assert.equal(res.status, 400);
     assert.equal(((await res.json()) as { message?: string }).message, 'Passwords do not match');
+  });
+});
+
+describe('single container web', () => {
+  function webDist(): string {
+    const dist = tempRoot();
+    fs.mkdirSync(path.join(dist, 'assets'));
+    fs.writeFileSync(path.join(dist, 'index.html'), '<div id="root">starter</div>');
+    fs.writeFileSync(path.join(dist, 'assets', 'app.js'), 'console.log("app")');
+    fs.writeFileSync(path.join(dist, 'link-check.html'), '<p>check</p>');
+    return dist;
+  }
+
+  it('serves the page and the API from one process', async () => {
+    const root = tempRoot();
+    const app = withWeb(createApp({ root, env: {} }), webDist());
+
+    const page = await app.request('/starter/');
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /starter/);
+    const asset = await app.request('/starter/assets/app.js');
+    assert.equal(asset.status, 200);
+    assert.match(await asset.text(), /console\.log/);
+    assert.equal((await app.request('/starter/link-check.html')).status, 200);
+    const route = await app.request('/starter/chat/abc');
+    assert.equal(route.status, 200);
+    assert.match(await route.text(), /starter/);
+    assert.equal((await app.request('/starter/assets/missing.js')).status, 404);
+
+    const home = await app.request('/');
+    assert.equal(home.status, 302);
+    assert.equal(home.headers.get('location'), '/starter/');
+
+    const status = await app.request('/starter/api/setup/status');
+    assert.equal(status.status, 200);
+    assert.equal(((await status.json()) as { linked: boolean }).linked, false);
+    assert.equal((await app.request('/api/setup/status')).status, 200);
+  });
+
+  it('passes a POST body through /starter/api', async () => {
+    const app = withWeb(createApp({ root: tempRoot(), env: {}, openUrl: async () => undefined }), webDist());
+    const res = await app.request('/starter/api/setup/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        openBrowser: false,
+        apiUrl: 'https://vectoree.net',
+        redirectOrigin: 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { status: string; authorizeUrl?: string };
+    assert.equal(body.status, 'pending');
+    assert.equal(
+      new URL(body.authorizeUrl ?? '').searchParams.get('redirect_uri'),
+      'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/api/setup/callback',
+    );
+  });
+
+  it('refuses to start without a built page', () => {
+    assert.throws(() => withWeb(createApp({ root: tempRoot(), env: {} }), tempRoot()), /index\.html/);
   });
 });

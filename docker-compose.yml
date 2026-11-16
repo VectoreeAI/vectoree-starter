@@ -2,30 +2,23 @@
 # 不发布端口、不读宿主文件、不写 container_name、镜像要么 build 要么固定 digest。
 # 本机开发的端口、.env、./.vectoree 挂载放在 docker-compose.local.yml：
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+#
+# 页面和 BFF 在同一个容器里。平台把所有服务挂到共用网络上，
+# 拆成两个服务时 web 按名字找 server，会落到别的应用的 server。
 
 services:
-  server:
-    restart: unless-stopped
-    build:
-      context: .
-      target: server
-    environment:
-      HOST: 0.0.0.0
-      PORT: "8787"
-    volumes:
-      - starter-data:/app/.vectoree
-
   web:
     restart: unless-stopped
     build:
       context: .
-      target: web
+      target: app
     environment:
-      API_PROXY: http://server:8787
+      HOST: 0.0.0.0
+      PORT: "5173"
+    volumes:
+      - starter-data:/app/.vectoree
     expose:
       - "5173"
-    depends_on:
-      - server
 
 volumes:
   # Keep the explicit {}: Vectoree rewrites this file, and a bare `starter-data:` comes out as '', which Compose rejects.
