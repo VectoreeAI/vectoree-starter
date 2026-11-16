@@ -614,9 +614,77 @@ describe('console connect', () => {
   it('rejects a callback with the wrong state', async () => {
     const root = tempRoot();
     const app = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
-    await startLogin(app);
+    const { state } = await startLogin(app);
     const res = await app.request('/api/setup/callback?code=auth-code&state=nope');
     assert.equal(res.status, 400);
+    const saved = JSON.parse(fs.readFileSync(path.join(root, '.vectoree', 'console-login.json'), 'utf8')) as {
+      state: string;
+    };
+    assert.equal(saved.state, state);
+  });
+
+  it('opens the same callback again and finishes it from the stored login', async () => {
+    const root = tempRoot();
+    const app = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
+    const origin = 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/';
+    const { state } = await startLogin(app, origin);
+    const loginFile = path.join(root, '.vectoree', 'console-login.json');
+    const stored = JSON.parse(fs.readFileSync(loginFile, 'utf8')) as { verifier: string; code?: string };
+    assert.equal(fs.statSync(loginFile).mode & 0o777, 0o600);
+    const callbackUrl = `/api/setup/callback?code=auth-code&state=${state}`;
+    const first = await app.request(callbackUrl);
+    const second = await app.request(callbackUrl);
+    assert.equal(first.status, 302);
+    assert.equal(second.status, 302);
+    assert.equal(second.headers.get('location'), 'https://rt-2b073c623d6e473c842409ca21ea9e39.vectoree.site/starter/');
+    const replayBody = await second.text();
+    assert.equal(replayBody.includes(stored.verifier), false);
+    assert.equal(replayBody.includes('auth-code'), false);
+    const kept = JSON.parse(fs.readFileSync(loginFile, 'utf8')) as { code?: string; verifier: string };
+    assert.equal(kept.code, 'auth-code');
+
+    const restarted = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
+    const again = await restarted.request(callbackUrl);
+    assert.equal(again.status, 302);
+    const statusText = await (await restarted.request('/api/setup/connect')).text();
+    assert.equal(JSON.parse(statusText).status, 'callback');
+    assert.equal(statusText.includes(stored.verifier), false);
+    assert.equal(statusText.includes('auth-code'), false);
+    const token = await restarted.request('/api/setup/token', { method: 'POST' });
+    assert.equal(token.status, 200);
+    assert.equal(fs.existsSync(loginFile), false);
+    const resumed = createApp({ root, env: {}, fetchImpl: consoleFetch(root) });
+    const resumedStatus = await (await resumed.request('/api/setup/connect')).text();
+    assert.equal(JSON.parse(resumedStatus).status, 'authorized');
+    assert.equal(resumedStatus.includes(access), false);
+    const listed = await resumed.request('/api/setup/projects');
+    assert.equal(listed.status, 200);
+  });
+
+  it('keeps a newer login when an older code exchange finishes', async () => {
+    const root = tempRoot();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/cli/token')) await gate;
+      return consoleFetch(root)(input, init);
+    }) as typeof fetch;
+    const app = createApp({ root, env: {}, fetchImpl });
+    const first = await startLogin(app);
+    await app.request(`/api/setup/callback?code=auth-code&state=${first.state}`);
+    const exchanging = app.request('/api/setup/token', { method: 'POST' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const second = await startLogin(app);
+    release();
+    const done = await exchanging;
+    assert.equal(done.status, 200);
+    const saved = JSON.parse(fs.readFileSync(path.join(root, '.vectoree', 'console-login.json'), 'utf8')) as {
+      state: string;
+    };
+    assert.equal(saved.state, second.state);
+    assert.equal(fs.existsSync(path.join(root, '.vectoree', 'console-session.json')), false);
   });
 
   it('returns to the app with an error when login is denied', async () => {
