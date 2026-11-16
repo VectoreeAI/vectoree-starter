@@ -69,6 +69,7 @@ const LINK_ONLY_PATHS = [
   '/api/setup/connect',
   '/api/setup/callback',
   '/api/setup/token',
+  '/api/setup/device',
   '/api/setup/projects',
   '/api/setup/link',
   '/api/settings',
@@ -203,6 +204,8 @@ export function createApp(deps: AppDeps): Hono {
   app.get('/api/setup/connect', (c) => c.json(linker.snapshot()));
 
   app.post('/api/setup/token', async (c) => c.json(await linker.exchange()));
+
+  app.post('/api/setup/device', async (c) => c.json(await linker.pollDevice()));
 
   app.get('/api/setup/projects', async (c) => c.json({ projects: await linker.listProjects() }));
 

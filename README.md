@@ -55,6 +55,8 @@ Previews live in BFF memory. Restarting the server drops them, and visitors see 
 
 **Connect through a forwarded port:** open the app at `http://127.0.0.1:5173/starter/` (or `http://localhost:5173/starter/`). Click **登录 Vectoree**. After Console login, the browser returns to `http://127.0.0.1:5173/starter/api/setup/callback` on that same forwarded port, which redirects back into the app. The web server proxies it to the BFF. You can also mount a `.vectoree/config.json` written elsewhere. If a previous `docker compose up` already created a directory named `.env`, remove that directory before relying on a real env file.
 
+**Connect on a hosted name:** open `https://rt-<app-id>.vectoree.site/starter/`, `https://vectoree.ai/starter/`, or `https://vectoree.net/starter/`. Click **登录 Vectoree**. The page shows a device code and a link. Open that link in a browser on your own computer and approve the code. The hosted machine does not launch a browser, and Vectoree does not redirect back to the hosted site. After approval the page lists your projects.
+
 ## Link a project
 
 Primary path is inside the app. See [vectoree.ai/SKILL.md](https://vectoree.ai/SKILL.md).
