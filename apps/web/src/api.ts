@@ -122,8 +122,19 @@ export function listConsoleProjects(): Promise<{ projects: ConsoleProject[] }> {
   return request('/api/setup/projects');
 }
 
-export function linkProject(projectId: string): Promise<ConnectStatus> {
-  return request('/api/setup/link', { method: 'POST', body: JSON.stringify({ projectId }) });
+export function linkProject(
+  projectId: string,
+  turnstileToken?: string,
+  hostedRelay = false,
+): Promise<ConnectStatus> {
+  return request('/api/setup/link', {
+    method: 'POST',
+    body: JSON.stringify({
+      projectId,
+      ...(turnstileToken ? { turnstileToken } : {}),
+      ...(hostedRelay ? { hostedRelay: true } : {}),
+    }),
+  });
 }
 
 export function getSession(): Promise<{ user: PublicUser | null }> {

@@ -29,8 +29,45 @@ function groupByOrganization(projects: ConsoleProject[]): ProjectGroup[] {
 
 type Phase = 'checking' | 'login' | 'redirecting' | 'device' | 'signingIn' | 'fetching' | 'choose' | 'linking' | 'done';
 
+type LinkCheckMessage = { type?: string; token?: string; skipped?: boolean; error?: string };
+
+const HOSTED_LINK_HOSTS = new Set(['vectoree.ai', 'www.vectoree.ai', 'vectoree.net', 'www.vectoree.net', 'vectoree.site']);
+const RUNTIME_SITE_HOST = /^rt-[0-9a-f]{32}\.vectoree\.site$/;
+
+function isHostedLinkPage(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return HOSTED_LINK_HOSTS.has(host) || RUNTIME_SITE_HOST.test(host);
+}
+
+function waitForLinkCheck(popup: Window, fail: (message: string) => Error): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => finish(() => reject(fail('timeout'))), 3 * 60 * 1000);
+    const closePoll = window.setInterval(() => {
+      if (popup.closed) finish(() => reject(fail('closed')));
+    }, 400);
+    function onMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin || event.source !== popup) return;
+      const data = event.data as LinkCheckMessage;
+      if (!data || data.type !== 'vectoree-link-turnstile') return;
+      if (typeof data.token === 'string' && data.token) finish(() => resolve(data.token));
+      else if (data.skipped) finish(() => resolve(undefined));
+      else finish(() => reject(fail(data.error || 'fail')));
+    }
+    function finish(done: () => void) {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onMessage);
+      window.clearTimeout(timer);
+      window.clearInterval(closePoll);
+      done();
+    }
+    window.addEventListener('message', onMessage);
+  });
+}
+
 export function SetupScreen({ onLinked }: { onLinked: () => void }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [phase, setPhase] = useState<Phase>('checking');
   const [apiUrl, setApiUrl] = useState('https://vectoree.ai');
   const [projects, setProjects] = useState<ConsoleProject[]>([]);
@@ -171,10 +208,22 @@ export function SetupScreen({ onLinked }: { onLinked: () => void }) {
 
   async function onLink() {
     if (!selected) return;
+    const page = new URL('link-check.html', new URL(import.meta.env.BASE_URL, window.location.origin));
+    page.searchParams.set('lang', locale.startsWith('zh') ? 'zh' : 'en');
+    const popup = window.open(page.href, 'vectoree-link-check', 'popup,width=440,height=560');
+    if (!popup) {
+      setError(t('popupBlocked'));
+      return;
+    }
     setPhase('linking');
     setError('');
     try {
-      const status = await linkProject(selected);
+      const token = await waitForLinkCheck(popup, (kind) => {
+        if (kind === 'timeout') return new Error(t('linkCheckTimeout'));
+        if (kind === 'closed') return new Error(t('linkCheckClosed'));
+        return new Error(kind === 'fail' ? t('linkCheckFail') : kind);
+      });
+      const status = await linkProject(selected, token, isHostedLinkPage(window.location.hostname));
       const project = projects.find((item) => item.id === selected);
       const name = status.projectName || project?.name || selected;
       setLinkedName(project?.organizationName ? `${project.organizationName} / ${name}` : name);
