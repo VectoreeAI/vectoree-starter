@@ -71,6 +71,7 @@ const LINK_ONLY_PATHS = [
   '/api/setup/token',
   '/api/setup/device',
   '/api/setup/projects',
+  '/api/setup/turnstile',
   '/api/setup/link',
   '/api/settings',
 ] as const;
@@ -209,10 +210,14 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get('/api/setup/projects', async (c) => c.json({ projects: await linker.listProjects() }));
 
+  app.get('/api/setup/turnstile', async (c) => c.json(await linker.turnstileSiteKey()));
+
   app.post('/api/setup/link', async (c) => {
     const body = await readJson(c);
     const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
-    return c.json(await linker.link(typeof record.projectId === 'string' ? record.projectId : ''));
+    const projectId = typeof record.projectId === 'string' ? record.projectId : '';
+    const turnstileToken = typeof record.turnstileToken === 'string' ? record.turnstileToken : undefined;
+    return c.json(await linker.link(projectId, turnstileToken));
   });
 
   app.get('/api/auth/session', (c) => c.json({ user: readSession(c)?.user ?? null }));

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vectoree link</title>
+    <style>
+      :root {
+        color: #101010;
+        background: #f1f1e8;
+        font-family: 'Space Grotesk', 'PingFang SC', 'Helvetica Neue', sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background-image:
+          linear-gradient(#00000009 1px, transparent 1px),
+          linear-gradient(90deg, #00000009 1px, transparent 1px);
+        background-size: 24px 24px;
+      }
+      main {
+        width: min(380px, calc(100% - 32px));
+        padding: 24px;
+        background: #fff;
+        border: 2px solid #101010;
+        box-shadow: 4px 4px 0 #101010;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 22px;
+      }
+      p {
+        margin: 0 0 16px;
+        line-height: 1.4;
+      }
+      #widget {
+        min-height: 65px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Link</h1>
+      <p id="status">…</p>
+      <div id="widget"></div>
+    </main>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+    <script>
+      const copy = {
+        zh: {
+          load: '正在准备人机校验',
+          wait: '请完成下面的人机校验',
+          done: '校验完成，可以回到项目页',
+          fail: '人机校验失败，请关掉窗口后重试',
+          login: '请先回到项目页登录 Vectoree',
+          unavailable: '人机校验暂时不可用',
+        },
+        en: {
+          load: 'Preparing the human check',
+          wait: 'Confirm you are human',
+          done: 'Done. Return to the starter.',
+          fail: 'Human verification failed. Close this window and try again.',
+          login: 'Log in to Vectoree from the starter page first',
+          unavailable: 'Human verification is unavailable',
+        },
+      };
+      const lang = new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'zh';
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      const text = copy[lang];
+      const status = document.getElementById('status');
+      function show(message) {
+        status.textContent = message;
+      }
+      function report(payload) {
+        if (!window.opener || window.opener.closed) return;
+        window.opener.postMessage({ type: 'vectoree-link-turnstile', ...payload }, window.location.origin);
+      }
+      show(text.load);
+      const siteKeyPattern = /^[A-Za-z0-9_-]{1,200}$/;
+      fetch(new URL('api/setup/turnstile', location.href), { headers: { Accept: 'application/json' } })
+        .then(async (response) => {
+          const data = await response.json().catch(() => ({}));
+          if (response.status === 401) {
+            show(text.login);
+            report({ error: data.message || text.login });
+            return;
+          }
+          if (!response.ok) {
+            show(data.message || text.unavailable);
+            report({ error: data.message || text.unavailable });
+            return;
+          }
+          const siteKey = typeof data.siteKey === 'string' ? data.siteKey.trim() : '';
+          if (!siteKey) {
+            show(text.done);
+            report({ skipped: true });
+            setTimeout(() => window.close(), 400);
+            return;
+          }
+          if (!siteKeyPattern.test(siteKey)) {
+            show(text.unavailable);
+            report({ error: text.unavailable });
+            return;
+          }
+          show(text.wait);
+          const started = Date.now();
+          const timer = setInterval(() => {
+            if (!window.turnstile) {
+              if (Date.now() - started > 15000) {
+                clearInterval(timer);
+                show(text.unavailable);
+                report({ error: text.unavailable });
+              }
+              return;
+            }
+            clearInterval(timer);
+            window.turnstile.render('#widget', {
+              sitekey: siteKey,
+              action: 'link',
+              callback: (token) => {
+                show(text.done);
+                report({ token });
+                setTimeout(() => window.close(), 600);
+              },
+              'error-callback': () => {
+                show(text.fail);
+                report({ error: text.fail });
+              },
+            });
+          }, 50);
+        })
+        .catch(() => {
+          show(text.unavailable);
+          report({ error: text.unavailable });
+        });
+    </script>
+  </body>
+</html>

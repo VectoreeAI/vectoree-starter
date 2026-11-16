@@ -125,7 +125,6 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
 
     async start(input: { apiUrl?: string; openBrowser?: boolean; redirectOrigin?: string }): Promise<ConnectPublic> {
       const apiUrl = normalizeApiUrl(input.apiUrl?.trim() || 'https://vectoree.ai');
-      if (isHostedConsoleOrigin(input.redirectOrigin)) return startDevice(apiUrl);
       const redirectUri = callbackUriFromOrigin(input.redirectOrigin) ?? 'http://127.0.0.1:5173/api/setup/callback';
       device = null;
       forgetSession();
@@ -278,7 +277,27 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       return projects.map((item) => ({ ...item }));
     },
 
-    link(projectId: string): Promise<ConnectPublic> {
+    async turnstileSiteKey(): Promise<{ siteKey: string | null }> {
+      const current = requireSession();
+      let response: Response;
+      try {
+        response = await fetchImpl(`${current.apiUrl}/api/system/auth/public-config`, {
+          headers: { Accept: 'application/json' },
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'network error';
+        throw new ConfigError(`Could not reach Vectoree at ${current.apiUrl} (${reason})`, 502);
+      }
+      const data = await readBody(response);
+      if (!response.ok) {
+        throw new ConfigError(readErrorMessage(data, `Could not load human verification (${response.status})`), 502);
+      }
+      const record = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+      const siteKey = text(record.turnstileSiteKey);
+      return { siteKey: siteKey || null };
+    },
+
+    link(projectId: string, turnstileToken?: string): Promise<ConnectPublic> {
       if (linking) return linking;
       const id = projectId.trim();
       if (!PROJECT_UUID.test(id)) {
@@ -302,6 +321,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
             projectId: id,
             projectName: match.name,
             root: options.root,
+            turnstileToken,
           });
           writeLinkedConfig(
             options.root,
@@ -443,11 +463,7 @@ export function callbackUriFromOrigin(origin: string | undefined): string | null
   const basePath = url.pathname.replace(/\/$/, '');
   const callback = `${url.origin}${basePath}/api/setup/callback`;
   const loopback = url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname) && Boolean(url.port);
-  const publicSite =
-    url.protocol === 'https:' &&
-    (url.hostname === 'vectoree.net' || url.hostname === 'www.vectoree.net') &&
-    (url.port === '' || url.port === '443');
-  if (!loopback && !publicSite) {
+  if (!loopback && !isHostedConsoleOrigin(trimmed)) {
     throw new ConfigError('Connect from the forwarded address http://127.0.0.1:5173');
   }
   return callback;
@@ -561,8 +577,9 @@ async function mintProjectKey(
   fetchImpl: typeof fetch,
   apiUrl: string,
   accessToken: string,
-  input: { projectId: string; projectName: string; root: string },
+  input: { projectId: string; projectName: string; root: string; turnstileToken?: string },
 ): Promise<{ apiKey: string; keyId?: string }> {
+  const token = input.turnstileToken?.trim();
   const response = await fetchImpl(`${apiUrl}/api/gateway/keys`, {
     method: 'POST',
     headers: {
@@ -571,6 +588,7 @@ async function mintProjectKey(
       Authorization: `Bearer ${accessToken}`,
       'X-Project-Id': input.projectId,
       'User-Agent': 'VectoreeCLI',
+      ...(token ? { 'X-Turnstile-Token': token } : {}),
     },
     body: JSON.stringify({
       name: `CLI — ${os.hostname()}`.slice(0, 128),

@@ -122,8 +122,11 @@ export function listConsoleProjects(): Promise<{ projects: ConsoleProject[] }> {
   return request('/api/setup/projects');
 }
 
-export function linkProject(projectId: string): Promise<ConnectStatus> {
-  return request('/api/setup/link', { method: 'POST', body: JSON.stringify({ projectId }) });
+export function linkProject(projectId: string, turnstileToken?: string): Promise<ConnectStatus> {
+  return request('/api/setup/link', {
+    method: 'POST',
+    body: JSON.stringify({ projectId, ...(turnstileToken ? { turnstileToken } : {}) }),
+  });
 }
 
 export function getSession(): Promise<{ user: PublicUser | null }> {
