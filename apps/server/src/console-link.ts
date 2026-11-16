@@ -53,6 +53,50 @@ type PendingDevice = {
 
 type ConsoleSession = { apiUrl: string; accessToken: string; refreshToken?: string };
 
+function consoleSessionFile(root: string): string {
+  return path.join(root, '.vectoree', 'console-session.json');
+}
+
+function writeConsoleSession(root: string, session: ConsoleSession): void {
+  const dir = path.join(root, '.vectoree');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = consoleSessionFile(root);
+  const tmp = path.join(dir, `.console-session.json.${process.pid}.tmp`);
+  const body = {
+    apiUrl: session.apiUrl,
+    accessToken: session.accessToken,
+    ...(session.refreshToken ? { refreshToken: session.refreshToken } : {}),
+  };
+  fs.writeFileSync(tmp, `${JSON.stringify(body)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // chmod can fail on some filesystems; the file is still written.
+  }
+}
+
+function readConsoleSession(root: string): ConsoleSession | null {
+  try {
+    const record = JSON.parse(fs.readFileSync(consoleSessionFile(root), 'utf8')) as Record<string, unknown>;
+    const apiUrl = text(record.apiUrl);
+    const accessToken = text(record.accessToken);
+    if (!apiUrl || !accessToken) return null;
+    const refreshToken = text(record.refreshToken);
+    return { apiUrl, accessToken, ...(refreshToken ? { refreshToken } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+function clearConsoleSession(root: string): void {
+  try {
+    fs.rmSync(consoleSessionFile(root), { force: true });
+  } catch {
+    // The login can continue without deleting a file that is already gone.
+  }
+}
+
 export function createConsoleLinker(options: ConsoleLinkerOptions) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const openUrl = options.openUrl ?? openSystemBrowser;
@@ -84,6 +128,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       if (isHostedConsoleOrigin(input.redirectOrigin)) return startDevice(apiUrl);
       const redirectUri = callbackUriFromOrigin(input.redirectOrigin) ?? 'http://127.0.0.1:5173/api/setup/callback';
       device = null;
+      forgetSession();
       const { verifier, challenge } = pkcePair();
       const stateValue = randomBytes(16).toString('hex');
       login = {
@@ -94,7 +139,6 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
         appUrl: appUrlFromCallback(redirectUri),
         expiresAt: Date.now() + timeoutMs,
       };
-      session = null;
       projects = [];
       const authorize = new URL(`${apiUrl}/api/system/auth/cli/authorize`);
       authorize.searchParams.set('response_type', 'code');
@@ -165,11 +209,11 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
             state = { status: 'error', apiUrl: current.apiUrl, message };
             throw new ConfigError(message, 502);
           }
-          session = {
+          rememberSession({
             apiUrl: current.apiUrl,
             accessToken: record.accessToken,
             refreshToken: typeof record.refreshToken === 'string' ? record.refreshToken : undefined,
-          };
+          });
           device = null;
           state = { status: 'authorized', apiUrl: current.apiUrl };
           return publicConnect(state);
@@ -193,18 +237,18 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
       const code = current.code;
       exchanging = (async () => {
         try {
-          session = {
+          rememberSession({
             apiUrl: current.apiUrl,
             ...(await exchangeCode(fetchImpl, current.apiUrl, {
               code,
               codeVerifier: current.verifier,
               redirectUri: current.redirectUri,
             })),
-          };
+          });
           state = { status: 'authorized', apiUrl: current.apiUrl };
           return { ...state };
         } catch (error) {
-          session = null;
+          forgetSession();
           const message = error instanceof Error ? error.message : 'Console login failed';
           state = { status: 'error', apiUrl: current.apiUrl, message };
           throw new ConfigError(message, 502);
@@ -272,7 +316,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
             },
             options.env,
           );
-          session = null;
+          forgetSession();
           projects = [];
           state = { status: 'linked', apiUrl: current.apiUrl, projectId: id, projectName: match.name };
           return { ...state };
@@ -292,7 +336,7 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
 
   async function startDevice(apiUrl: string): Promise<ConnectPublic> {
     login = null;
-    session = null;
+    forgetSession();
     projects = [];
     let response: Response;
     try {
@@ -333,15 +377,28 @@ export function createConsoleLinker(options: ConsoleLinkerOptions) {
     return publicConnect(state);
   }
 
+  function rememberSession(next: ConsoleSession) {
+    session = next;
+    writeConsoleSession(options.root, next);
+  }
+
+  function forgetSession() {
+    session = null;
+    clearConsoleSession(options.root);
+  }
+
   function requireSession(): ConsoleSession {
-    if (!session || state.status !== 'authorized') {
-      throw new ConfigError('Log in to Vectoree first', 401);
+    if (!session) {
+      const stored = readConsoleSession(options.root);
+      if (stored) session = stored;
     }
+    if (!session) throw new ConfigError('Log in to Vectoree first', 401);
+    if (state.status !== 'authorized') state = { status: 'authorized', apiUrl: session.apiUrl };
     return session;
   }
 
   function expireSession(message: string) {
-    session = null;
+    forgetSession();
     projects = [];
     state = { status: 'error', apiUrl: state.apiUrl, message };
   }
