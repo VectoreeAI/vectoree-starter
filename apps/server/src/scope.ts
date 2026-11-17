@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import { ConfigError, DEFAULT_API_URL, deploymentMode, normalizeApiUrl, resolveConfig, type AppConfig } from './config.js';
+import { ConfigError, DEFAULT_API_URL, deploymentMode, normalizeApiUrl, readLoginEnabled, resolveConfig, type AppConfig } from './config.js';
 import { readPreview, type PreviewRecord } from './preview.js';
 import { readErrorMessage } from './vectoree.js';
 
@@ -19,12 +19,13 @@ export function resolveScope(c: Context, root: string, env: NodeJS.ProcessEnv): 
       apiKey: preview.apiKey,
       projectId: preview.projectId,
       linked: true,
+      loginEnabled: readLoginEnabled(root),
       previewId: preview.id,
     };
   }
   const config = resolveConfig(root, env);
-  if (!config.linked || !config.apiKey) throw new ConfigError('Link a Vectoree project first');
-  return { ...config, apiKey: config.apiKey };
+  if (!config.linked || !config.apiKey) throw new ConfigError('Configure a Vectoree API key in Settings');
+  return { ...config, apiKey: config.apiKey, projectId: config.projectId || 'local' };
 }
 
 export function previewRequired(): ConfigError {

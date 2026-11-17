@@ -18,12 +18,11 @@ import {
 } from './api';
 import { AuthScreen } from './screens/AuthScreen';
 import { ChatScreen } from './screens/ChatScreen';
-import { SetupScreen } from './screens/SetupScreen';
 import { SettingsDialog } from './screens/SettingsDialog';
 import { getLocale, translate, useI18n } from './i18n';
 import { Gear, Shell, Stage, VeeMark } from './ui';
 
-type Gate = 'loading' | 'setup' | 'expired' | 'auth' | 'chat';
+type Gate = 'loading' | 'expired' | 'auth' | 'chat';
 
 /** The ticket is single use, so both StrictMode effect runs share one attempt. */
 let redeemAttempt: Promise<string> | null = null;
@@ -54,6 +53,7 @@ export function App() {
   const [projectName, setProjectName] = useState<string | undefined>();
   const [apiUrl, setApiUrl] = useState<string | undefined>();
   const [user, setUser] = useState<PublicUser | null>(null);
+  const [hasKey, setHasKey] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -87,8 +87,13 @@ export function App() {
             setGate('expired');
             return;
           }
-          setProjectName(status.projectName);
-          setApiUrl(status.apiUrl);
+          setHasKey(true);
+        } else {
+          setHasKey(Boolean(status.linked));
+        }
+        setProjectName(status.projectName);
+        setApiUrl(status.apiUrl);
+        if (status.loginEnabled) {
           const session = await getSession();
           if (cancelled) return;
           if (!session.user) {
@@ -96,27 +101,12 @@ export function App() {
             return;
           }
           setUser(session.user);
-          setGate('chat');
-          return;
         }
-        if (!status.linked) {
-          setGate('setup');
-          return;
-        }
-        setProjectName(status.projectName);
-        setApiUrl(status.apiUrl);
-        const session = await getSession();
-        if (cancelled) return;
-        if (!session.user) {
-          setGate('auth');
-          return;
-        }
-        setUser(session.user);
         setGate('chat');
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : translate(getLocale(), 'serverUnreachable'));
-        setGate(isCloud ? 'expired' : 'setup');
+        setGate(isCloud ? 'expired' : 'chat');
       }
     })();
     return () => {
@@ -150,28 +140,7 @@ export function App() {
     );
   }
 
-  if (gate === 'setup') {
-    return (
-      <Shell>
-        {error ? (
-          <div className="stage">
-            <div className="error">{error}</div>
-          </div>
-        ) : null}
-        <SetupScreen
-          onLinked={() => {
-            setError('');
-            setGate('auth');
-            void getSetupStatus().then((status) => {
-              setProjectName(status.projectName);
-            });
-          }}
-        />
-      </Shell>
-    );
-  }
-
-  if (gate === 'auth' || !user) {
+  if (gate === 'auth') {
     return (
       <AuthScreen
         templateName="vectoree starter"
@@ -189,7 +158,12 @@ export function App() {
     <SignedIn
       user={user}
       cloud={cloud}
+      hasKey={hasKey}
       projectName={projectName}
+      onLoginEnabled={(enabled) => {
+        setHasKey(true);
+        if (enabled && !user) setGate('auth');
+      }}
       onSignedOut={() => {
         setUser(null);
         setGate('auth');
@@ -201,12 +175,16 @@ export function App() {
 function SignedIn({
   user,
   cloud,
+  hasKey,
   projectName,
+  onLoginEnabled,
   onSignedOut,
 }: {
-  user: PublicUser;
+  user: PublicUser | null;
   cloud: boolean;
+  hasKey: boolean;
   projectName?: string;
+  onLoginEnabled: (enabled: boolean) => void;
   onSignedOut: () => void;
 }) {
   const { t } = useI18n();
@@ -443,14 +421,15 @@ function SignedIn({
             </button>
             <UserChip
             navOpen={navOpen}
-            email={user.email}
+            email={user?.email}
             projectName={projectName}
             onSettings={() => setSettingsOpen(true)}
-            onLogout={() => void onLogout()}
+            onLogout={user ? () => void onLogout() : undefined}
             />
           </div>
         </aside>
         <div className="workspace-main">
+          {hasKey ? null : <p className="note workspace-note">{t('needApiKey')}</p>}
           <ChatScreen
             conversationId={conversationId}
             titledByModel={Boolean(conversations.find((item) => item.id === conversationId)?.titledByModel)}
@@ -465,12 +444,13 @@ function SignedIn({
       {settingsOpen ? (
         <SettingsDialog
           cloud={cloud}
-          email={user.email}
+          email={user?.email ?? ''}
           models={models}
           model={model}
           imageModel={imageModel}
           onModel={setModel}
           onImageModel={setImageModel}
+          onLoginEnabled={onLoginEnabled}
           onClose={() => setSettingsOpen(false)}
         />
       ) : null}
@@ -489,17 +469,17 @@ function UserChip({
   onLogout,
 }: {
   navOpen: boolean;
-  email: string;
+  email?: string;
   projectName?: string;
   onSettings: () => void;
-  onLogout: () => void;
+  onLogout?: () => void;
 }) {
   const { t } = useI18n();
   const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [box, setBox] = useState<{ left: number; bottom: number; width: number } | null>(null);
-  const title = projectName || email;
-  const initial = (email.trim()[0] || title.trim()[0] || '?').toUpperCase();
+  const title = projectName || email || t('localUse');
+  const initial = ((email || title).trim()[0] || '?').toUpperCase();
 
   function place() {
     const node = rootRef.current;
@@ -584,19 +564,23 @@ function UserChip({
             <FeedbackIcon />
             {t('feedback')}
           </a>
-          <div className="side-menu-split" />
-          <button
-            className="side-menu-item"
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setOpen(false);
-              onLogout();
-            }}
-          >
-            <LogoutIcon />
-            {t('logout')}
-          </button>
+          {onLogout ? (
+            <>
+              <div className="side-menu-split" />
+              <button
+                className="side-menu-item"
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  onLogout();
+                }}
+              >
+                <LogoutIcon />
+                {t('logout')}
+              </button>
+            </>
+          ) : null}
         </div>
       ) : null}
     </div>

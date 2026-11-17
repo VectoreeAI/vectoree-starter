@@ -10,6 +10,7 @@ export function SettingsDialog({
   imageModel,
   onModel,
   onImageModel,
+  onLoginEnabled,
   onClose,
 }: {
   /** Cloud previews keep the project key on the server, so there is nothing to edit here. */
@@ -20,12 +21,15 @@ export function SettingsDialog({
   imageModel: string;
   onModel: (id: string) => void;
   onImageModel: (id: string) => void;
+  onLoginEnabled?: (enabled: boolean) => void;
   onClose: () => void;
 }) {
   const { t } = useI18n();
   const [tab, setTab] = useState<'model' | 'account'>('model');
   const [apiUrl, setApiUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [hasKey, setHasKey] = useState(false);
+  const [loginEnabled, setLoginEnabled] = useState(false);
   const [reveal, setReveal] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -33,13 +37,14 @@ export function SettingsDialog({
   const imageModels = models.filter((item) => item.imageOutput);
 
   useEffect(() => {
-    if (cloud) return undefined;
     let cancelled = false;
     void getSettings()
       .then((payload) => {
         if (cancelled) return;
         setApiUrl(payload.apiUrl);
-        setApiKey(payload.apiKey);
+        setApiKey(payload.apiKey ?? '');
+        setHasKey(payload.hasKey);
+        setLoginEnabled(payload.loginEnabled);
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof Error ? err.message : t('loadSettingsFail'));
@@ -61,10 +66,15 @@ export function SettingsDialog({
     setBusy(true);
     setError('');
     try {
-      const saved = await saveSettings({ apiUrl, apiKey });
+      const saved = await saveSettings(
+        cloud ? { loginEnabled } : { apiUrl, apiKey, loginEnabled: hasKey ? loginEnabled : false },
+      );
       setApiUrl(saved.apiUrl);
-      setApiKey(saved.apiKey);
+      if (saved.apiKey) setApiKey(saved.apiKey);
+      setHasKey(saved.hasKey);
+      setLoginEnabled(saved.loginEnabled);
       setReveal(false);
+      onLoginEnabled?.(saved.loginEnabled);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('saveSettingsFail'));
     } finally {
@@ -104,17 +114,19 @@ export function SettingsDialog({
           >
             {t('model')}
           </button>
-          <button
-            className="settings-tab"
-            type="button"
-            role="tab"
-            id="settings-tab-account"
-            aria-selected={tab === 'account'}
-            aria-controls="settings-panel-account"
-            onClick={() => setTab('account')}
-          >
-            {t('account')}
-          </button>
+          {email ? (
+            <button
+              className="settings-tab"
+              type="button"
+              role="tab"
+              id="settings-tab-account"
+              aria-selected={tab === 'account'}
+              aria-controls="settings-panel-account"
+              onClick={() => setTab('account')}
+            >
+              {t('account')}
+            </button>
+          ) : null}
         </div>
         {tab === 'account' ? (
           <div id="settings-panel-account" role="tabpanel" aria-labelledby="settings-tab-account">
@@ -186,12 +198,22 @@ export function SettingsDialog({
                 ))}
               </select>
             </label>
+            <label className="login-toggle">
+              <input
+                type="checkbox"
+                checked={loginEnabled}
+                disabled={!hasKey || busy}
+                onChange={(event) => setLoginEnabled(event.target.checked)}
+              />
+              <span>
+                <span className="eyebrow">{t('loginPage')}</span>
+                <span className="note">{hasKey ? t('loginPageNote') : t('loginPageNeedKey')}</span>
+              </span>
+            </label>
             {error ? <div className="error">{error}</div> : null}
-            {cloud ? null : (
-              <button className="btn" type="button" disabled={busy || !apiUrl || !apiKey} onClick={() => void onSave()}>
-                {busy ? t('saving') : t('saveLink')}
-              </button>
-            )}
+            <button className="btn" type="button" disabled={busy || (!cloud && (!apiUrl || !apiKey))} onClick={() => void onSave()}>
+              {busy ? t('saving') : t('saveLink')}
+            </button>
           </div>
         )}
       </div>
