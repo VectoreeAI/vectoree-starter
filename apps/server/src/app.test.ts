@@ -208,6 +208,7 @@ describe('setup status', () => {
     assert.deepEqual(body, {
       linked: true,
       mode: 'local',
+      loginEnabled: false,
       projectId: 'proj_123',
       apiUrl: 'https://vectoree.ai',
     });
@@ -230,6 +231,7 @@ describe('setup status', () => {
     assert.deepEqual(JSON.parse(text), {
       linked: true,
       mode: 'local',
+      loginEnabled: false,
       projectId: 'from-env',
       apiUrl: 'https://vectoree.ai',
     });
@@ -252,7 +254,10 @@ describe('setup status', () => {
   });
 
   it('reports unlinked when nothing is configured', () => {
-    assert.deepEqual(publicSetupStatus({ apiUrl: 'https://vectoree.ai', linked: false }), { linked: false });
+    assert.deepEqual(publicSetupStatus({ apiUrl: 'https://vectoree.ai', linked: false, loginEnabled: false }), {
+      linked: false,
+      loginEnabled: false,
+    });
   });
 
   it('starts unlinked when .env is a directory', async () => {
@@ -262,7 +267,7 @@ describe('setup status', () => {
     loadEnvFiles(root, env);
     const app = createApp({ root, env });
     const body = (await (await app.request('/api/setup/status')).json()) as { linked: boolean; mode?: string };
-    assert.deepEqual(body, { linked: false, mode: 'local' });
+    assert.deepEqual(body, { linked: false, loginEnabled: false, mode: 'local' });
   });
 
   it('treats a CLI config file as linked without POST /api/setup', async () => {
@@ -286,6 +291,7 @@ describe('setup status', () => {
     assert.deepEqual(JSON.parse(text), {
       linked: true,
       mode: 'local',
+      loginEnabled: false,
       projectId: 'proj_cli',
       projectName: 'Demo',
       apiUrl: 'https://vectoree.ai',
@@ -330,7 +336,7 @@ describe('setup status', () => {
     fs.rmSync(path.join(root, '.env'), { force: true });
     const app = createApp({ root, env });
     const body = (await (await app.request('/api/setup/status')).json()) as { linked: boolean; mode?: string };
-    assert.deepEqual(body, { linked: false, mode: 'local' });
+    assert.deepEqual(body, { linked: false, loginEnabled: false, mode: 'local' });
     assert.equal(env.VECTOREE_PROJECT_ID, undefined);
     assert.equal(env.VECTOREE_API_KEY, undefined);
     assert.equal(JSON.stringify(body).includes(secret), false);
@@ -349,7 +355,7 @@ describe('setup status', () => {
     fs.rmSync(path.join(root, '.env'), { force: true });
     const app = createApp({ root, env });
     const status = (await (await app.request('/api/setup/status')).json()) as { linked: boolean };
-    assert.deepEqual(status, { linked: false, mode: 'local' });
+    assert.deepEqual(status, { linked: false, loginEnabled: false, mode: 'local' });
     assert.equal(env.VECTOREE_PROJECT_ID, undefined);
     assert.equal(env.VECTOREE_API_KEY, undefined);
     const chat = await app.request('/api/chat', {
@@ -362,7 +368,7 @@ describe('setup status', () => {
     assert.equal(models.status, 400);
   });
 
-  it('stays unlinked when the file has a key but no project id', async () => {
+  it('treats a saved API key as configured even without a project id', async () => {
     const root = tempRoot();
     fs.mkdirSync(path.join(root, '.vectoree'), { recursive: true });
     fs.writeFileSync(
@@ -370,15 +376,16 @@ describe('setup status', () => {
       JSON.stringify({ apiUrl: 'https://vectoree.ai', apiKey: secret }),
     );
     const app = createApp({ root, env: {} });
-    const body = (await (await app.request('/api/setup/status')).json()) as { linked: boolean };
-    assert.equal(body.linked, false);
+    const body = (await (await app.request('/api/setup/status')).json()) as { linked: boolean; loginEnabled?: boolean };
+    assert.equal(body.linked, true);
+    assert.equal(body.loginEnabled, false);
     assert.equal(JSON.stringify(body).includes(secret), false);
   });
 
   it('reports cloud mode without treating a missing link as the link page', async () => {
     const app = createApp({ root: tempRoot(), env: { DEPLOY_MODE: 'cloud' } });
     const body = (await (await app.request('/api/setup/status')).json()) as { linked: boolean; mode: string };
-    assert.deepEqual(body, { linked: false, mode: 'cloud', previewed: false });
+    assert.deepEqual(body, { linked: false, loginEnabled: false, mode: 'cloud', previewed: false });
     assert.equal(deploymentMode({}), 'local');
     assert.equal(deploymentMode({ DEPLOY_MODE: '' }), 'local');
     assert.equal(deploymentMode({ DEPLOY_MODE: 'local' }), 'local');
@@ -403,6 +410,7 @@ describe('gates', () => {
       projectId: 'proj_123',
       apiKey: secret,
     });
+    turnLoginOn(root);
     const linked = createApp({ root, env: {} });
     const signedOut = await linked.request('/api/models');
     assert.equal(signedOut.status, 401);
@@ -822,8 +830,15 @@ describe('console connect', () => {
   });
 });
 
+function turnLoginOn(root: string): void {
+  const file = path.join(root, '.vectoree', 'config.json');
+  const current = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+  current.loginEnabled = 'true';
+  fs.writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`);
+}
+
 describe('settings', () => {
-  it('returns the project key only after sign-in', async () => {
+  it('returns the project key without sign-in while the login page is off', async () => {
     const root = tempRoot();
     writeProjectConfig(root, {
       apiUrl: 'https://vectoree.ai',
@@ -832,15 +847,42 @@ describe('settings', () => {
     });
     const app = createApp({ root, env: {} });
     const unsigned = await app.request('/api/settings');
-    assert.equal(unsigned.status, 401);
+    const open = (await unsigned.json()) as { apiUrl: string; apiKey: string; hasKey: boolean; loginEnabled: boolean };
+    assert.equal(unsigned.status, 200);
+    assert.equal(open.apiKey, secret);
+    assert.equal(open.hasKey, true);
+    assert.equal(open.loginEnabled, false);
     const statusText = await (await app.request('/api/setup/status')).text();
     assert.equal(statusText.includes(secret), false);
+    turnLoginOn(root);
+    const locked = createApp({ root, env: {} });
+    const hidden = await locked.request('/api/settings');
+    assert.equal(hidden.status, 401);
     const token = seedSession({ user: { id: 'user_1', email: 'a@example.com' }, accessToken: 'app-jwt' });
-    const res = await app.request('/api/settings', { headers: { Cookie: `${SESSION_COOKIE}=${token}` } });
-    const body = (await res.json()) as { apiUrl: string; apiKey: string };
+    const res = await locked.request('/api/settings', { headers: { Cookie: `${SESSION_COOKIE}=${token}` } });
+    const body = (await res.json()) as { apiUrl: string; apiKey: string; loginEnabled: boolean };
     assert.equal(res.status, 200);
     assert.equal(body.apiUrl, 'https://vectoree.ai');
     assert.equal(body.apiKey, secret);
+    assert.equal(body.loginEnabled, true);
+  });
+
+  it('refuses to open the login page before an API key is saved', async () => {
+    const root = tempRoot();
+    const app = createApp({
+      root,
+      env: {},
+      fetchImpl: (async () => Response.json({ data: [] })) as typeof fetch,
+    });
+    const res = await app.request('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiUrl: 'https://vectoree.ai', loginEnabled: true }),
+    });
+    const body = (await res.json()) as { message?: string };
+    assert.equal(res.status, 400);
+    assert.match(body.message ?? '', /sk-ve-/);
+    assert.equal(fs.existsSync(path.join(root, '.vectoree', 'config.json')), false);
   });
 });
 
@@ -871,6 +913,7 @@ describe('conversations', () => {
       projectId: 'proj_123',
       apiKey: secret,
     });
+    turnLoginOn(root);
     const linked = createApp({ root, env: {} });
     const unsigned = await linked.request('/api/conversations');
     assert.equal(unsigned.status, 401);
@@ -1092,6 +1135,7 @@ describe('setup validate', () => {
       assert.deepEqual(JSON.parse(text), {
         linked: true,
         mode: 'local',
+        loginEnabled: false,
         projectId: 'proj_123',
         apiUrl: 'https://vectoree.ai',
       });
@@ -1472,6 +1516,7 @@ describe('database', () => {
       projectId: 'proj_123',
       apiKey: secret,
     });
+    turnLoginOn(root);
     const linked = createApp({ root, env: {} });
     const signedOut = await linked.request('/api/database/tables');
     assert.equal(signedOut.status, 401);
@@ -1886,6 +1931,7 @@ describe('storage', () => {
     const unlinked = createApp({ root: tempRoot(), env: {} });
     assert.equal((await unlinked.request('/api/storage/buckets')).status, 400);
     const { root } = linked();
+    turnLoginOn(root);
     const signedOut = createApp({ root, env: {} });
     assert.equal((await signedOut.request('/api/storage/buckets')).status, 401);
   });
@@ -2098,13 +2144,14 @@ describe('cloud preview', () => {
     const root = linkedRoot();
     const app = createApp({ root, env: cloudEnv({ VECTOREE_PROJECT_ID: 'from-env', VECTOREE_API_KEY: secret }) });
     const bare = await app.request('/api/setup/status');
-    assert.deepEqual(await bare.json(), { linked: false, mode: 'cloud', previewed: false });
+    assert.deepEqual(await bare.json(), { linked: false, loginEnabled: false, mode: 'cloud', previewed: false });
 
     const pid = seedPreview({ apiUrl: vectoree, apiKey: keyA, projectId: 'proj_a' });
     const res = await app.request('/api/setup/status', { headers: { Cookie: `${PREVIEW_COOKIE}=${pid}` } });
     const text = await res.text();
     assert.deepEqual(JSON.parse(text), {
       linked: false,
+      loginEnabled: false,
       mode: 'cloud',
       previewed: true,
       projectId: 'proj_a',
@@ -2347,8 +2394,6 @@ describe('cloud preview', () => {
       ['GET', '/api/setup/projects'],
       ['GET', '/api/setup/turnstile'],
       ['POST', '/api/setup/link'],
-      ['GET', '/api/settings'],
-      ['PATCH', '/api/settings'],
     ] as const) {
       const res = await app.request(route, { method, headers, ...(method === 'GET' ? {} : { body }) });
       const text = await res.text();
@@ -2357,6 +2402,29 @@ describe('cloud preview', () => {
     }
     assert.equal(fs.existsSync(path.join(root, '.vectoree', 'config.json')), false);
     assert.equal(fs.existsSync(path.join(root, '.env')), false);
+
+    const settings = await app.request('/api/settings', { headers });
+    const opened = (await settings.json()) as { hasKey?: boolean; loginEnabled?: boolean; apiKey?: string };
+    assert.equal(settings.status, 200);
+    assert.equal(opened.hasKey, true);
+    assert.equal(opened.loginEnabled, false);
+    assert.equal(opened.apiKey, undefined);
+    const rejected = await app.request('/api/settings', { method: 'PATCH', headers, body });
+    assert.equal(rejected.status, 400);
+    assert.equal(fs.existsSync(path.join(root, '.vectoree', 'config.json')), false);
+    const toggled = await app.request('/api/settings', {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ loginEnabled: true }),
+    });
+    assert.equal(toggled.status, 200);
+    const saved = JSON.parse(fs.readFileSync(path.join(root, '.vectoree', 'config.json'), 'utf8')) as {
+      loginEnabled?: string;
+      apiKey?: string;
+    };
+    assert.equal(saved.loginEnabled, 'true');
+    assert.equal(saved.apiKey, undefined);
+    assert.equal(JSON.stringify(saved).includes(keyA), false);
   });
 
   it('keeps conversations apart per project and per user in the backend table', async () => {

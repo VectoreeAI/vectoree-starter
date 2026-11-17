@@ -3,7 +3,7 @@ import type { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { ConfigError, type AppConfig } from './config.js';
 import { resolveScope } from './scope.js';
-import { readSession } from './session.js';
+import { actorId } from './session.js';
 import { readErrorMessage } from './vectoree.js';
 
 const TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -154,7 +154,7 @@ async function withSession(
   run: (config: AppConfig & { apiKey: string }) => Promise<Response>,
 ): Promise<Response> {
   const config = resolveScope(c, deps.root, deps.env);
-  if (!readSession(c)) return c.json({ message: 'Sign in required' }, 401);
+  if (!actorId(c, config.loginEnabled)) return c.json({ message: 'Sign in required' }, 401);
   return run(config);
 }
 

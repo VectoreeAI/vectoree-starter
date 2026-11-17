@@ -3,7 +3,7 @@ import type { Context } from 'hono';
 import type { Hono } from 'hono';
 import { ConfigError, type AppConfig } from './config.js';
 import { resolveScope } from './scope.js';
-import { readSession } from './session.js';
+import { actorId } from './session.js';
 import { objectKey, objectPath, putObject, storageFetch } from './storage.js';
 import { FALLBACK_MODEL, readErrorMessage } from './vectoree.js';
 
@@ -268,15 +268,14 @@ async function withUser(
   run: (owner: Owner, config: AppConfig & { apiKey: string }) => Promise<Response>,
 ): Promise<Response> {
   const config = resolveScope(c, deps.root, deps.env);
-  const session = readSession(c);
-  if (!session) return c.json({ message: 'Sign in required' }, 401);
-  if (!config.projectId || !config.apiKey) throw new ConfigError('Link a Vectoree project first');
+  const userId = actorId(c, config.loginEnabled);
+  if (!userId) return c.json({ message: 'Sign in required' }, 401);
   const owner: Owner = {
     fetchImpl: deps.fetchImpl,
     apiUrl: config.apiUrl,
     apiKey: config.apiKey,
-    projectId: config.projectId,
-    userId: session.user.id,
+    projectId: config.projectId || 'local',
+    userId,
   };
   await ensureOnce(`table\n${owner.apiUrl}\n${owner.projectId}`, () => createChatTable(owner));
   return run(owner, config);

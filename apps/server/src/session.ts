@@ -39,6 +39,16 @@ export function updateSession(c: Context, record: SessionRecord): void {
   sessions.set(id, record);
 }
 
+/** Owner id for chats when the login page is off. */
+export const LOCAL_ACTOR_ID = 'local';
+
+/** Signed-in user, or the local actor when login is off. Null means a sign-in is required. */
+export function actorId(c: Context, loginEnabled: boolean): string | null {
+  const session = readSession(c);
+  if (session) return session.user.id;
+  return loginEnabled ? null : LOCAL_ACTOR_ID;
+}
+
 export function readSession(c: Context): SessionRecord | null {
   const id = getCookie(c, COOKIE);
   if (!id) return null;
