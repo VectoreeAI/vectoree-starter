@@ -9,8 +9,10 @@ import {
   parseSetupInput,
   publicSetupStatus,
   deploymentMode,
+  readLoginEnabled,
   resolveConfig,
   writeLinkedConfig,
+  writeLoginEnabled,
   type AppConfig,
 } from './config.js';
 import { mountConversations } from './conversations.js';
@@ -18,8 +20,8 @@ import { mountDatabase } from './database.js';
 import { mountStorage } from './storage.js';
 import { createImageToolResponse } from './image-tool.js';
 import { createPreview, readPreview } from './preview.js';
-import { cloudApiUrl, parseTicket, redeemTicket, resolveScope, type ProjectScope } from './scope.js';
-import { createSession, destroySession, readSession, updateSession } from './session.js';
+import { cloudApiUrl, parseTicket, previewRequired, redeemTicket, resolveScope, type ProjectScope } from './scope.js';
+import { actorId, createSession, destroySession, readSession, updateSession } from './session.js';
 import {
   buildChatMessages,
   FALLBACK_MODEL,
@@ -73,7 +75,6 @@ const LINK_ONLY_PATHS = [
   '/api/setup/projects',
   '/api/setup/turnstile',
   '/api/setup/link',
-  '/api/settings',
 ] as const;
 
 export function createApp(deps: AppDeps): Hono {
@@ -122,6 +123,7 @@ export function createApp(deps: AppDeps): Hono {
         linked: false,
         mode: 'cloud',
         previewed: Boolean(preview),
+        loginEnabled: Boolean(preview) && readLoginEnabled(deps.root),
         ...(preview ? { projectId: preview.projectId, apiUrl: preview.apiUrl } : {}),
       });
     }
@@ -131,7 +133,7 @@ export function createApp(deps: AppDeps): Hono {
     if (!config.linked || !config.apiKey) {
       return c.json({
         linked: false,
-        message: 'No project link yet. Use 连接 Vectoree on Setup.',
+        message: 'Configure a Vectoree API key in Settings',
       });
     }
     const check = await probeModels(config.apiUrl, config.apiKey);
@@ -140,28 +142,52 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.get('/api/settings', (c) => {
-    const config = requireLinked(c, deps.root, env);
-    if (!readSession(c)) return c.json({ message: 'Sign in required' }, 401);
-    return c.json({ apiUrl: config.apiUrl, apiKey: config.apiKey });
+    if (deploymentMode(env) === 'cloud') {
+      const preview = readPreview(c);
+      if (!preview) throw previewRequired();
+      return c.json({
+        apiUrl: preview.apiUrl,
+        hasKey: true,
+        loginEnabled: readLoginEnabled(deps.root),
+      });
+    }
+    const config = resolveConfig(deps.root, env);
+    if (config.loginEnabled && !readSession(c)) return c.json({ message: 'Sign in required' }, 401);
+    return c.json({
+      apiUrl: config.apiUrl,
+      apiKey: config.apiKey ?? '',
+      hasKey: Boolean(config.apiKey),
+      loginEnabled: config.loginEnabled,
+    });
   });
 
   app.patch('/api/settings', async (c) => {
-    const config = requireLinked(c, deps.root, env);
-    if (!readSession(c)) return c.json({ message: 'Sign in required' }, 401);
     const body = await readJson(c);
     const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    if (deploymentMode(env) === 'cloud') {
+      const preview = readPreview(c);
+      if (!preview) throw previewRequired();
+      if ('apiKey' in record || 'apiUrl' in record) throw new ConfigError('The preview API key is managed by Vectoree');
+      if (typeof record.loginEnabled !== 'boolean') throw new ConfigError('loginEnabled must be a boolean');
+      writeLoginEnabled(deps.root, record.loginEnabled);
+      return c.json({ apiUrl: preview.apiUrl, hasKey: true, loginEnabled: record.loginEnabled });
+    }
+    const config = resolveConfig(deps.root, env);
+    if (config.loginEnabled && !readSession(c)) return c.json({ message: 'Sign in required' }, 401);
     const apiUrl = typeof record.apiUrl === 'string' ? normalizeApiUrl(record.apiUrl) : config.apiUrl;
-    const apiKey = typeof record.apiKey === 'string' && record.apiKey.trim() ? record.apiKey.trim() : config.apiKey;
+    const apiKey = typeof record.apiKey === 'string' && record.apiKey.trim() ? record.apiKey.trim() : config.apiKey ?? '';
     if (!apiKey.startsWith('sk-ve-')) throw new ConfigError('apiKey must be a project key starting with sk-ve-');
-    if (!config.projectId) throw new ConfigError('Link a Vectoree project first');
+    const loginEnabled = typeof record.loginEnabled === 'boolean' ? record.loginEnabled : config.loginEnabled;
+    if (loginEnabled && !apiKey) throw new ConfigError('Configure a Vectoree API key before opening the login page');
     const check = await probeModels(apiUrl, apiKey);
     if (!check.ok) return c.json({ message: check.message }, 400);
     writeLinkedConfig(
       deps.root,
-      { apiUrl, apiKey, projectId: config.projectId, projectName: config.projectName },
+      { apiUrl, apiKey, projectId: config.projectId || 'local', ...(config.projectName ? { projectName: config.projectName } : {}) },
       env,
     );
-    return c.json({ apiUrl, apiKey });
+    writeLoginEnabled(deps.root, loginEnabled);
+    return c.json({ apiUrl, apiKey, hasKey: true, loginEnabled });
   });
 
   app.post('/api/setup', async (c) => {
@@ -170,14 +196,7 @@ export function createApp(deps: AppDeps): Hono {
     if (!check.ok) return c.json({ message: check.message }, 400);
     writeLinkedConfig(deps.root, input, env);
     const runtime = resolveConfig(deps.root, env);
-    return c.json(
-      publicSetupStatus({
-        linked: true,
-        apiUrl: runtime.apiUrl,
-        projectId: runtime.projectId ?? input.projectId,
-        apiKey: runtime.apiKey,
-      }),
-    );
+    return c.json(publicSetupStatus(runtime));
   });
 
   app.post('/api/setup/connect', async (c) => {
@@ -245,7 +264,7 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get('/api/models', async (c) => {
     const config = requireLinked(c, deps.root, env);
-    if (!readSession(c)) return c.json({ message: 'Sign in required' }, 401);
+    if (!actorId(c, config.loginEnabled)) return c.json({ message: 'Sign in required' }, 401);
     const upstream = await vectoreeFetch(fetchImpl, config, '/api/v1/models', { method: 'GET' });
     const data = await readJsonSafe(upstream);
     if (!upstream.ok) {
@@ -261,7 +280,7 @@ export function createApp(deps: AppDeps): Hono {
 
   app.post('/api/chat', async (c) => {
     const config = requireLinked(c, deps.root, env);
-    if (!readSession(c)) return c.json({ message: 'Sign in required' }, 401);
+    if (!actorId(c, config.loginEnabled)) return c.json({ message: 'Sign in required' }, 401);
     const raw = await c.req.text();
     if (raw.length > 12_000_000) return c.json({ message: 'Request is too large' }, 413);
     let body: unknown;

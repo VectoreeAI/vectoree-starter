@@ -18,6 +18,8 @@ export type AppConfig = {
   projectName?: string;
   apiKey?: string;
   linked: boolean;
+  /** App-user login is off until a project key is saved and this is turned on. */
+  loginEnabled: boolean;
 };
 
 export type SetupInput = {
@@ -67,8 +69,8 @@ export function resolveConfig(root: string, env: NodeJS.ProcessEnv = process.env
   rememberShellCredentials(env);
   const file = readConfigFile(root);
   const disk = readDiskEnv(root);
-  const fileLinked = usableLink(file.projectId, file.apiKey);
-  const diskLinked = usableLink(disk.VECTOREE_PROJECT_ID, disk.VECTOREE_API_KEY);
+  const fileLinked = usableKey(file.apiKey);
+  const diskLinked = usableKey(disk.VECTOREE_API_KEY);
   if (!fileLinked && !diskLinked) {
     const shell = shellCredentials.get(env);
     assignOrDelete(env, 'VECTOREE_PROJECT_ID', shell?.projectId);
@@ -92,19 +94,47 @@ export function resolveConfig(root: string, env: NodeJS.ProcessEnv = process.env
     projectId,
     projectName,
     apiKey,
-    linked: usableLink(projectId, apiKey),
+    linked: usableKey(apiKey),
+    loginEnabled: file.loginEnabled === 'true' && usableKey(apiKey),
   };
+}
+
+export function readLoginEnabled(root: string): boolean {
+  return readConfigFile(root).loginEnabled === 'true';
+}
+
+export function writeLoginEnabled(root: string, enabled: boolean): void {
+  const dir = path.join(root, '.vectoree');
+  const file = path.join(dir, 'config.json');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const existing = readConfigFile(root);
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(existing)) {
+    if (value && key !== 'loginEnabled') next[key] = value;
+  }
+  next.loginEnabled = enabled ? 'true' : 'false';
+  const tmp = path.join(dir, `.config.json.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try {
+    fs.chmodSync(dir, 0o700);
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // chmod can fail on some filesystems; the file is still written.
+  }
 }
 
 export function publicSetupStatus(config: AppConfig): {
   linked: boolean;
+  loginEnabled: boolean;
   projectId?: string;
   projectName?: string;
   apiUrl?: string;
 } {
-  if (!config.linked) return { linked: false };
+  if (!config.linked) return { linked: false, loginEnabled: false };
   return {
     linked: true,
+    loginEnabled: config.loginEnabled,
     ...(config.projectId ? { projectId: config.projectId } : {}),
     ...(config.projectName ? { projectName: config.projectName } : {}),
     apiUrl: config.apiUrl,
@@ -282,8 +312,8 @@ function blankToUndefined(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function usableLink(projectId: string | undefined, apiKey: string | undefined): boolean {
-  return Boolean(blankToUndefined(projectId) && blankToUndefined(apiKey)?.startsWith('sk-ve-'));
+function usableKey(apiKey: string | undefined): boolean {
+  return Boolean(blankToUndefined(apiKey)?.startsWith('sk-ve-'));
 }
 
 function assignOrDelete(env: NodeJS.ProcessEnv, key: 'VECTOREE_PROJECT_ID' | 'VECTOREE_API_KEY', value: string | undefined): void {

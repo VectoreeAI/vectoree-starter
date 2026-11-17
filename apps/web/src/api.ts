@@ -3,10 +3,19 @@ export type SetupStatus = {
   mode?: 'local' | 'cloud';
   /** Cloud only: this browser holds a redeemed preview. */
   previewed?: boolean;
+  /** True only when a project key exists and the login page was turned on. */
+  loginEnabled?: boolean;
   projectId?: string;
   projectName?: string;
   apiUrl?: string;
   warning?: string;
+};
+
+export type AppSettings = {
+  apiUrl: string;
+  apiKey?: string;
+  hasKey: boolean;
+  loginEnabled: boolean;
 };
 
 export type ConnectStatus = {
@@ -176,11 +185,11 @@ export function logoutAccount() {
   return request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
 }
 
-export function getSettings(): Promise<{ apiUrl: string; apiKey: string }> {
+export function getSettings(): Promise<AppSettings> {
   return request('/api/settings');
 }
 
-export function saveSettings(input: { apiUrl: string; apiKey: string }): Promise<{ apiUrl: string; apiKey: string }> {
+export function saveSettings(input: { apiUrl?: string; apiKey?: string; loginEnabled?: boolean }): Promise<AppSettings> {
   return request('/api/settings', { method: 'PATCH', body: JSON.stringify(input) });
 }
 
